@@ -194,18 +194,7 @@ func main() {
 		io.WriteString(w, "User-agent: *\nDisallow: /\n")
 	}))
 	mux.Handle("/generate_204", http.HandlerFunc(serveNoContent))
-	debug := tsweb.Debugger(mux)
-	debug.KV("TLS hostname", *hostname)
-	debug.KV("Mesh key", s.HasMeshKey())
-	debug.Handle("check", "Consistency check", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		err := s.ConsistencyCheck()
-		if err != nil {
-			http.Error(w, err.Error(), 500)
-		} else {
-			io.WriteString(w, "derp.Server ConsistencyCheck okay")
-		}
 	}))
-	debug.Handle("traffic", "Traffic check", http.HandlerFunc(s.ServeDebugTraffic))
 
 	if *runSTUN {
 		go serveSTUN(listenHost, *stunPort)

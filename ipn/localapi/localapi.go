@@ -13,7 +13,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net"
 	"net/http"
 	"net/http/httputil"
@@ -659,6 +658,10 @@ func (h *Handler) serveDebugPortmap(w http.ResponseWriter, r *http.Request) {
 	default:
 		http.Error(w, "unknown portmap debug type", http.StatusBadRequest)
 		return
+	}
+
+	if defBool(r.FormValue("log_http"), false) {
+		debugKnobs.LogHTTP = true
 	}
 
 	var (
@@ -1708,7 +1711,7 @@ func (h *Handler) serveTKADisable(w http.ResponseWriter, r *http.Request) {
 	}
 
 	body := io.LimitReader(r.Body, 1024*1024)
-	secret, err := ioutil.ReadAll(body)
+	secret, err := io.ReadAll(body)
 	if err != nil {
 		http.Error(w, "reading secret", 400)
 		return
@@ -1781,7 +1784,7 @@ func (h *Handler) serveTKAAffectedSigs(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "use POST", http.StatusMethodNotAllowed)
 		return
 	}
-	keyID, err := ioutil.ReadAll(http.MaxBytesReader(w, r.Body, 2048))
+	keyID, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 2048))
 	if err != nil {
 		http.Error(w, "reading body", http.StatusBadRequest)
 		return
@@ -1850,7 +1853,7 @@ func (h *Handler) serveTKACosignRecoveryAUM(w http.ResponseWriter, r *http.Reque
 	}
 
 	body := io.LimitReader(r.Body, 1024*1024)
-	aumBytes, err := ioutil.ReadAll(body)
+	aumBytes, err := io.ReadAll(body)
 	if err != nil {
 		http.Error(w, "reading AUM", http.StatusBadRequest)
 		return
@@ -1881,7 +1884,7 @@ func (h *Handler) serveTKASubmitRecoveryAUM(w http.ResponseWriter, r *http.Reque
 	}
 
 	body := io.LimitReader(r.Body, 1024*1024)
-	aumBytes, err := ioutil.ReadAll(body)
+	aumBytes, err := io.ReadAll(body)
 	if err != nil {
 		http.Error(w, "reading AUM", http.StatusBadRequest)
 		return

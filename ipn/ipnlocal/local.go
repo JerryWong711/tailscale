@@ -50,6 +50,7 @@ import (
 	"tailscale.com/net/dnscache"
 	"tailscale.com/net/dnsfallback"
 	"tailscale.com/net/interfaces"
+	"tailscale.com/net/netmon"
 	"tailscale.com/net/netns"
 	"tailscale.com/net/netutil"
 	"tailscale.com/net/tsaddr"
@@ -342,7 +343,7 @@ func NewLocalBackend(logf logger.Logf, logID logid.PublicID, sys *tsd.System, lo
 	b.prevIfState = netMon.InterfaceState()
 	// Call our linkChange code once with the current state, and
 	// then also whenever it changes:
-	b.linkChange(false, netMon.InterfaceState())
+	b.linkChange(&netmon.ChangeDelta{New: netMon.InterfaceState()})
 	b.unregisterNetMon = netMon.RegisterChangeCallback(b.linkChange)
 
 	b.unregisterHealthWatch = health.RegisterWatcher(b.onHealthChange)
@@ -508,11 +509,11 @@ func (b *LocalBackend) pauseOrResumeControlClientLocked() {
 }
 
 // linkChange is our network monitor callback, called whenever the network changes.
-// major is whether ifst is different than earlier.
-func (b *LocalBackend) linkChange(major bool, ifst *interfaces.State) {
+func (b *LocalBackend) linkChange(delta *netmon.ChangeDelta) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
+	ifst := delta.New
 	hadPAC := b.prevIfState.HasPAC()
 	b.prevIfState = ifst
 	b.pauseOrResumeControlClientLocked()
@@ -650,6 +651,7 @@ func (b *LocalBackend) UpdateStatus(sb *ipnstate.StatusBuilder) {
 func (b *LocalBackend) updateStatus(sb *ipnstate.StatusBuilder, extraLocked func(*ipnstate.StatusBuilder)) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+
 	sb.MutateStatus(func(s *ipnstate.Status) {
 		s.Version = version.Long()
 		s.TUN = !b.sys.IsNetstack()
@@ -700,7 +702,19 @@ func (b *LocalBackend) updateStatus(sb *ipnstate.StatusBuilder, extraLocked func
 			}
 		}
 	})
+
+	var tailscaleIPs []netip.Addr
+	if b.netMap != nil {
+		for _, addr := range b.netMap.Addresses {
+			if addr.IsSingleIP() {
+				sb.AddTailscaleIP(addr.Addr())
+				tailscaleIPs = append(tailscaleIPs, addr.Addr())
+			}
+		}
+	}
+
 	sb.MutateSelfStatus(func(ss *ipnstate.PeerStatus) {
+		ss.OS = version.OS()
 		ss.Online = health.GetInPollNetMap()
 		if b.netMap != nil {
 			ss.InNetworkMap = true
@@ -715,6 +729,10 @@ func (b *LocalBackend) updateStatus(sb *ipnstate.StatusBuilder, extraLocked func
 					ss.Capabilities = c.AsSlice()
 				}
 			}
+			for _, addr := range tailscaleIPs {
+				ss.TailscaleIPs = append(ss.TailscaleIPs, addr)
+			}
+
 		} else {
 			ss.HostName, _ = os.Hostname()
 		}
@@ -782,6 +800,7 @@ func (b *LocalBackend) populatePeerStatusLocked(sb *ipnstate.StatusBuilder) {
 // peerStatusFromNode copies fields that exist in the Node struct for
 // current node and peers into the provided PeerStatus.
 func peerStatusFromNode(ps *ipnstate.PeerStatus, n tailcfg.NodeView) {
+	ps.PublicKey = n.Key()
 	ps.ID = n.StableID()
 	ps.Created = n.Created()
 	ps.ExitNodeOption = tsaddr.ContainsExitRoutes(n.AllowedIPs())
@@ -869,9 +888,9 @@ func (b *LocalBackend) SetDecompressor(fn func() (controlclient.Decompressor, er
 	b.newDecompressor = fn
 }
 
-// setClientStatus is the callback invoked by the control client whenever it posts a new status.
+// SetControlClientStatus is the callback invoked by the control client whenever it posts a new status.
 // Among other things, this is where we update the netmap, packet filters, DNS and DERP maps.
-func (b *LocalBackend) setClientStatus(st controlclient.Status) {
+func (b *LocalBackend) SetControlClientStatus(st controlclient.Status) {
 	// The following do not depend on any data for which we need to lock b.
 	if st.Err != nil {
 		// TODO(crawshaw): display in the UI.
@@ -928,7 +947,7 @@ func (b *LocalBackend) setClientStatus(st controlclient.Status) {
 				// Call ourselves with the current status again; the logic in
 				// setClientStatus will take care of updating the expired field
 				// of peers in the netmap.
-				b.setClientStatus(st)
+				b.SetControlClientStatus(st)
 			})
 		}
 	}
@@ -1438,7 +1457,7 @@ func (b *LocalBackend) Start(opts ipn.Options) error {
 		OnClientVersion:      b.onClientVersion,
 		OnControlTime:        b.em.onControlTime,
 		Dialer:               b.Dialer(),
-		Status:               b.setClientStatus,
+		Observer:             b,
 		C2NHandler:           http.HandlerFunc(b.handleC2N),
 		DialPlan:             &b.dialPlan, // pointer because it can't be copied
 
@@ -3044,7 +3063,7 @@ func (b *LocalBackend) authReconfig() {
 		return
 	}
 
-	oneCGNATRoute := shouldUseOneCGNATRoute(nm, b.logf, version.OS())
+	oneCGNATRoute := shouldUseOneCGNATRoute(b.logf, version.OS())
 	rcfg := b.routerConfig(cfg, prefs, oneCGNATRoute)
 	dcfg := dnsConfigForNetmap(nm, prefs, b.logf, version.OS())
 
@@ -3062,7 +3081,7 @@ func (b *LocalBackend) authReconfig() {
 //
 // The versionOS is a Tailscale-style version ("iOS", "macOS") and not
 // a runtime.GOOS.
-func shouldUseOneCGNATRoute(nm *netmap.NetworkMap, logf logger.Logf, versionOS string) bool {
+func shouldUseOneCGNATRoute(logf logger.Logf, versionOS string) bool {
 	// Explicit enabling or disabling always take precedence.
 	if v, ok := controlclient.ControlOneCGNATSetting().Get(); ok {
 		logf("[v1] shouldUseOneCGNATRoute: explicit=%v", v)

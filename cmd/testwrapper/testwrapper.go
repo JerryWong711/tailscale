@@ -232,7 +232,7 @@ func main() {
 		var thisRun *nextRun
 		thisRun, toRun = toRun[0], toRun[1:]
 
-		if thisRun.attempt >= maxAttempts {
+		if thisRun.attempt > maxAttempts {
 			fmt.Println("max attempts reached")
 			os.Exit(1)
 		}
@@ -247,6 +247,12 @@ func main() {
 			go runTests(ctx, thisRun.attempt, pt, otherArgs, ch)
 			for tr := range ch {
 				if tr.pkgFinished {
+					if tr.outcome == "fail" && len(toRetry[tr.name.pkg]) == 0 {
+						// If a package fails and we don't have any tests to
+						// retry, then we should fail. This typically happens
+						// when a package times out.
+						failed = true
+					}
 					printPkgOutcome(tr.name.pkg, tr.outcome, thisRun.attempt)
 					continue
 				}

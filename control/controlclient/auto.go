@@ -138,18 +138,19 @@ type updateGen int64
 // Auto connects to a tailcontrol server for a node.
 // It's a concrete implementation of the Client interface.
 type Auto struct {
-	direct     *Direct // our interface to the server APIs
-	clock      tstime.Clock
-	logf       logger.Logf
-	expiry     *time.Time
-	closed     bool
-	updateCh   chan struct{} // readable when we should inform the server of a change
-	newMapCh   chan struct{} // readable when we must restart a map request
-	statusFunc func(Status)  // called to update Client status; always non-nil
+	direct   *Direct // our interface to the server APIs
+	clock    tstime.Clock
+	logf     logger.Logf
+	closed   bool
+	updateCh chan struct{} // readable when we should inform the server of a change
+	newMapCh chan struct{} // readable when we must restart a map request
+	observer Observer      // called to update Client status; always non-nil
 
 	unregisterHealthWatch func()
 
 	mu sync.Mutex // mutex guards the following fields
+
+	expiry time.Time
 
 	// lastUpdateGen is the gen of last update we had an update worth sending to
 	// the server.
@@ -194,8 +195,8 @@ func NewNoStart(opts Options) (_ *Auto, err error) {
 		}
 	}()
 
-	if opts.Status == nil {
-		return nil, errors.New("missing required Options.Status")
+	if opts.Observer == nil {
+		return nil, errors.New("missing required Options.Observer")
 	}
 	if opts.Logf == nil {
 		opts.Logf = func(fmt string, args ...any) {}
@@ -213,7 +214,7 @@ func NewNoStart(opts Options) (_ *Auto, err error) {
 		authDone:   make(chan struct{}),
 		mapDone:    make(chan struct{}),
 		updateDone: make(chan struct{}),
-		statusFunc: opts.Status,
+		observer:   opts.Observer,
 	}
 	c.authCtx, c.authCancel = context.WithCancel(context.Background())
 	c.authCtx = sockstats.WithSockStats(c.authCtx, sockstats.LabelControlClientAuto, opts.Logf)
@@ -456,17 +457,17 @@ func (c *Auto) authRoutine() {
 	}
 }
 
-// Expiry returns the credential expiration time, or the zero time if
-// the expiration time isn't known. Used in tests only.
-func (c *Auto) Expiry() *time.Time {
+// ExpiryForTests returns the credential expiration time, or the zero value if
+// the expiration time isn't known. It's used in tests only.
+func (c *Auto) ExpiryForTests() time.Time {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.expiry
 }
 
-// Direct returns the underlying direct client object. Used in tests
-// only.
-func (c *Auto) Direct() *Direct {
+// DirectForTest returns the underlying direct client object.
+// It's used in tests only.
+func (c *Auto) DirectForTest() *Direct {
 	return c.direct
 }
 
@@ -496,7 +497,7 @@ func (mrs mapRoutineState) UpdateFullNetmap(nm *netmap.NetworkMap) {
 	if c.loggedIn {
 		c.state = StateSynchronized
 	}
-	c.expiry = ptr.To(nm.Expiry)
+	c.expiry = nm.Expiry
 	stillAuthed := c.loggedIn
 	c.logf("[v1] mapRoutine: netmap received: %s", c.state)
 	c.mu.Unlock()
@@ -669,7 +670,7 @@ func (c *Auto) sendStatus(who string, err error, url string, nm *netmap.NetworkM
 		State:          state,
 		Err:            err,
 	}
-	c.statusFunc(new)
+	c.observer.SetControlClientStatus(new)
 
 	c.mu.Lock()
 	c.inSendStatus--

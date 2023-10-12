@@ -16,6 +16,8 @@
 //   - TS_ROUTES: subnet routes to advertise.
 //   - TS_DEST_IP: proxy all incoming Tailscale traffic to the given
 //     destination.
+//   - TS_TAILNET_TARGET_IP: proxy all incoming non-Tailscale traffic to the given
+//     destination.
 //   - TS_TAILSCALED_EXTRA_ARGS: extra arguments to 'tailscaled'.
 //   - TS_EXTRA_ARGS: extra arguments to 'tailscale login', these are not
 //     reset on restart.
@@ -34,9 +36,15 @@
 //   - TS_SOCKET: the path where the tailscaled LocalAPI socket should
 //     be created.
 //   - TS_AUTH_ONCE: if true, only attempt to log in if not already
-//     logged in. If false (the default, for backwards
-//     compatibility), forcibly log in every time the
-//     container starts.
+//     logged in. If false, forcibly log in every time the container starts.
+//     The default until 1.50.0 was false, but that was misleading: until
+//     1.50, containerboot used `tailscale up` which would ignore an authkey
+//     argument if there was already a node key. Effectively, this behaved
+//     as though TS_AUTH_ONCE were always true.
+//     In 1.50.0 the change was made to use `tailscale login` instead of `up`,
+//     and login will reauthenticate every time it is given an authkey.
+//     In 1.50.1 we set the TS_AUTH_ONCE to true, to match the previously
+//     observed behavior.
 //   - TS_SERVE_CONFIG: if specified, is the file path where the ipn.ServeConfig is located.
 //     It will be applied once tailscaled is up and running. If the file contains
 //     ${TS_CERT_DOMAIN}, it will be replaced with the value of the available FQDN.
@@ -76,9 +84,18 @@ import (
 	"golang.org/x/sys/unix"
 	"tailscale.com/client/tailscale"
 	"tailscale.com/ipn"
+	"tailscale.com/types/logger"
 	"tailscale.com/types/ptr"
 	"tailscale.com/util/deephash"
+	"tailscale.com/util/linuxfw"
 )
+
+func newNetfilterRunner(logf logger.Logf) (linuxfw.NetfilterRunner, error) {
+	if defaultBool("TS_TEST_FAKE_NETFILTER", false) {
+		return linuxfw.NewFakeIPTablesRunner(), nil
+	}
+	return linuxfw.New(logf)
+}
 
 func main() {
 	log.SetPrefix("boot: ")
@@ -88,8 +105,9 @@ func main() {
 		AuthKey:         defaultEnvs([]string{"TS_AUTHKEY", "TS_AUTH_KEY"}, ""),
 		Hostname:        defaultEnv("TS_HOSTNAME", ""),
 		Routes:          defaultEnv("TS_ROUTES", ""),
-		ProxyTo:         defaultEnv("TS_DEST_IP", ""),
 		ServeConfigPath: defaultEnv("TS_SERVE_CONFIG", ""),
+		ProxyTo:         defaultEnv("TS_DEST_IP", ""),
+		TailnetTargetIP: defaultEnv("TS_TAILNET_TARGET_IP", ""),
 		DaemonExtraArgs: defaultEnv("TS_TAILSCALED_EXTRA_ARGS", ""),
 		ExtraArgs:       defaultEnv("TS_EXTRA_ARGS", ""),
 		InKubernetes:    os.Getenv("KUBERNETES_SERVICE_HOST") != "",
@@ -100,23 +118,24 @@ func main() {
 		SOCKSProxyAddr:  defaultEnv("TS_SOCKS5_SERVER", ""),
 		HTTPProxyAddr:   defaultEnv("TS_OUTBOUND_HTTP_PROXY_LISTEN", ""),
 		Socket:          defaultEnv("TS_SOCKET", "/tmp/tailscaled.sock"),
-		AuthOnce:        defaultBool("TS_AUTH_ONCE", false),
+		AuthOnce:        defaultBool("TS_AUTH_ONCE", true),
 		Root:            defaultEnv("TS_TEST_ONLY_ROOT", "/"),
 	}
 
 	if cfg.ProxyTo != "" && cfg.UserspaceMode {
 		log.Fatal("TS_DEST_IP is not supported with TS_USERSPACE")
 	}
-	if cfg.ProxyTo != "" && cfg.ServeConfigPath != "" {
-		log.Fatal("TS_DEST_IP is not supported with TS_SERVE_CONFIG")
+
+	if cfg.TailnetTargetIP != "" && cfg.UserspaceMode {
+		log.Fatal("TS_TAILNET_TARGET_IP is not supported with TS_USERSPACE")
 	}
 
 	if !cfg.UserspaceMode {
 		if err := ensureTunFile(cfg.Root); err != nil {
 			log.Fatalf("Unable to create tuntap device file: %v", err)
 		}
-		if cfg.ProxyTo != "" || cfg.Routes != "" {
-			if err := ensureIPForwarding(cfg.Root, cfg.ProxyTo, cfg.Routes); err != nil {
+		if cfg.ProxyTo != "" || cfg.Routes != "" || cfg.TailnetTargetIP != "" {
+			if err := ensureIPForwarding(cfg.Root, cfg.ProxyTo, cfg.TailnetTargetIP, cfg.Routes); err != nil {
 				log.Printf("Failed to enable IP forwarding: %v", err)
 				log.Printf("To run tailscale as a proxy or router container, IP forwarding must be enabled.")
 				if cfg.InKubernetes {
@@ -248,10 +267,13 @@ authLoop:
 	if err := tailscaleSet(ctx, cfg); err != nil {
 		log.Fatalf("failed to auth tailscale: %v", err)
 	}
-	// Remove any serve config that may have been set by a previous
-	// run of containerboot.
-	if err := client.SetServeConfig(ctx, new(ipn.ServeConfig)); err != nil {
-		log.Fatalf("failed to unset serve config: %v", err)
+
+	if cfg.ServeConfigPath != "" {
+		// Remove any serve config that may have been set by a previous run of
+		// containerboot, but only if we're providing a new one.
+		if err := client.SetServeConfig(ctx, new(ipn.ServeConfig)); err != nil {
+			log.Fatalf("failed to unset serve config: %v", err)
+		}
 	}
 
 	if cfg.InKubernetes && cfg.KubeSecret != "" && cfg.KubernetesCanPatch && cfg.AuthOnce {
@@ -270,7 +292,7 @@ authLoop:
 	}
 
 	var (
-		wantProxy         = cfg.ProxyTo != ""
+		wantProxy         = cfg.ProxyTo != "" || cfg.TailnetTargetIP != ""
 		wantDeviceInfo    = cfg.InKubernetes && cfg.KubeSecret != "" && cfg.KubernetesCanPatch
 		startupTasksDone  = false
 		currentIPs        deephash.Sum // tailscale IPs assigned to device
@@ -281,6 +303,13 @@ authLoop:
 	)
 	if cfg.ServeConfigPath != "" {
 		go watchServeConfigChanges(ctx, cfg.ServeConfigPath, certDomainChanged, certDomain, client)
+	}
+	var nfr linuxfw.NetfilterRunner
+	if wantProxy {
+		nfr, err = newNetfilterRunner(log.Printf)
+		if err != nil {
+			log.Fatalf("error creating new netfilter runner: %v", err)
+		}
 	}
 	for {
 		n, err := w.Next()
@@ -298,10 +327,12 @@ authLoop:
 		}
 		if n.NetMap != nil {
 			addrs := n.NetMap.SelfNode.Addresses().AsSlice()
-			if cfg.ProxyTo != "" && len(addrs) > 0 && deephash.Update(&currentIPs, &addrs) {
+			newCurrentIPs := deephash.Hash(&addrs)
+			ipsHaveChanged := newCurrentIPs != currentIPs
+			if cfg.ProxyTo != "" && len(addrs) > 0 && ipsHaveChanged {
 				log.Printf("Installing proxy rules")
-				if err := installIPTablesRule(ctx, cfg.ProxyTo, addrs); err != nil {
-					log.Fatalf("installing proxy rules: %v", err)
+				if err := installIngressForwardingRule(ctx, cfg.ProxyTo, addrs, nfr); err != nil {
+					log.Fatalf("installing ingress proxy rules: %v", err)
 				}
 			}
 			if cfg.ServeConfigPath != "" && len(n.NetMap.DNS.CertDomains) > 0 {
@@ -314,6 +345,13 @@ authLoop:
 					}
 				}
 			}
+			if cfg.TailnetTargetIP != "" && ipsHaveChanged && len(addrs) > 0 {
+				if err := installEgressForwardingRule(ctx, cfg.TailnetTargetIP, addrs, nfr); err != nil {
+					log.Fatalf("installing egress proxy rules: %v", err)
+				}
+			}
+			currentIPs = newCurrentIPs
+
 			deviceInfo := []any{n.NetMap.SelfNode.StableID(), n.NetMap.SelfNode.Name()}
 			if cfg.InKubernetes && cfg.KubernetesCanPatch && cfg.KubeSecret != "" && deephash.Update(&currentDeviceInfo, &deviceInfo) {
 				if err := storeDeviceInfo(ctx, cfg.KubeSecret, n.NetMap.SelfNode.StableID(), n.NetMap.SelfNode.Name(), n.NetMap.SelfNode.Addresses().AsSlice()); err != nil {
@@ -572,14 +610,25 @@ func ensureTunFile(root string) error {
 }
 
 // ensureIPForwarding enables IPv4/IPv6 forwarding for the container.
-func ensureIPForwarding(root, proxyTo, routes string) error {
+func ensureIPForwarding(root, clusterProxyTarget, tailnetTargetiP, routes string) error {
 	var (
 		v4Forwarding, v6Forwarding bool
 	)
-	if proxyTo != "" {
-		proxyIP, err := netip.ParseAddr(proxyTo)
+	if clusterProxyTarget != "" {
+		proxyIP, err := netip.ParseAddr(clusterProxyTarget)
 		if err != nil {
-			return fmt.Errorf("invalid proxy destination IP: %v", err)
+			return fmt.Errorf("invalid cluster destination IP: %v", err)
+		}
+		if proxyIP.Is4() {
+			v4Forwarding = true
+		} else {
+			v6Forwarding = true
+		}
+	}
+	if tailnetTargetiP != "" {
+		proxyIP, err := netip.ParseAddr(tailnetTargetiP)
+		if err != nil {
+			return fmt.Errorf("invalid tailnet destination IP: %v", err)
 		}
 		if proxyIP.Is4() {
 			v4Forwarding = true
@@ -629,16 +678,12 @@ func ensureIPForwarding(root, proxyTo, routes string) error {
 	return nil
 }
 
-func installIPTablesRule(ctx context.Context, dstStr string, tsIPs []netip.Prefix) error {
+func installEgressForwardingRule(ctx context.Context, dstStr string, tsIPs []netip.Prefix, nfr linuxfw.NetfilterRunner) error {
 	dst, err := netip.ParseAddr(dstStr)
 	if err != nil {
 		return err
 	}
-	argv0 := "iptables"
-	if dst.Is6() {
-		argv0 = "ip6tables"
-	}
-	var local string
+	var local netip.Addr
 	for _, pfx := range tsIPs {
 		if !pfx.IsSingleIP() {
 			continue
@@ -646,30 +691,65 @@ func installIPTablesRule(ctx context.Context, dstStr string, tsIPs []netip.Prefi
 		if pfx.Addr().Is4() != dst.Is4() {
 			continue
 		}
-		local = pfx.Addr().String()
+		local = pfx.Addr()
 		break
 	}
-	if local == "" {
+	if !local.IsValid() {
 		return fmt.Errorf("no tailscale IP matching family of %s found in %v", dstStr, tsIPs)
 	}
-	// Technically, if the control server ever changes the IPs assigned to this
-	// node, we'll slowly accumulate iptables rules. This shouldn't happen, so
-	// for now we'll live with it.
-	cmd := exec.CommandContext(ctx, argv0, "-t", "nat", "-I", "PREROUTING", "1", "-d", local, "-j", "DNAT", "--to-destination", dstStr)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("executing iptables failed: %w", err)
+	if err := nfr.DNATNonTailscaleTraffic("tailscale0", dst); err != nil {
+		return fmt.Errorf("installing egress proxy rules: %w", err)
+	}
+	if err := nfr.AddSNATRuleForDst(local, dst); err != nil {
+		return fmt.Errorf("installing egress proxy rules: %w", err)
+	}
+	if err := nfr.ClampMSSToPMTU("tailscale0", dst); err != nil {
+		return fmt.Errorf("installing egress proxy rules: %w", err)
+	}
+	return nil
+}
+
+func installIngressForwardingRule(ctx context.Context, dstStr string, tsIPs []netip.Prefix, nfr linuxfw.NetfilterRunner) error {
+	dst, err := netip.ParseAddr(dstStr)
+	if err != nil {
+		return err
+	}
+	var local netip.Addr
+	for _, pfx := range tsIPs {
+		if !pfx.IsSingleIP() {
+			continue
+		}
+		if pfx.Addr().Is4() != dst.Is4() {
+			continue
+		}
+		local = pfx.Addr()
+		break
+	}
+	if !local.IsValid() {
+		return fmt.Errorf("no tailscale IP matching family of %s found in %v", dstStr, tsIPs)
+	}
+	if err := nfr.AddDNATRule(local, dst); err != nil {
+		return fmt.Errorf("installing ingress proxy rules: %w", err)
+	}
+	if err := nfr.ClampMSSToPMTU("tailscale0", dst); err != nil {
+		return fmt.Errorf("installing ingress proxy rules: %w", err)
 	}
 	return nil
 }
 
 // settings is all the configuration for containerboot.
 type settings struct {
-	AuthKey            string
-	Hostname           string
-	Routes             string
-	ProxyTo            string
+	AuthKey  string
+	Hostname string
+	Routes   string
+	// ProxyTo is the destination IP to which all incoming
+	// Tailscale traffic should be proxied. If empty, no proxying
+	// is done. This is typically a locally reachable IP.
+	ProxyTo string
+	// TailnetTargetIP is the destination IP to which all incoming
+	// non-Tailscale traffic should be proxied. If empty, no
+	// proxying is done. This is typically a Tailscale IP.
+	TailnetTargetIP    string
 	ServeConfigPath    string
 	DaemonExtraArgs    string
 	ExtraArgs          string

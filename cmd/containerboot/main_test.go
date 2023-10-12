@@ -129,7 +129,10 @@ func TestContainerBoot(t *testing.T) {
 		{
 			// Out of the box default: runs in userspace mode, ephemeral storage, interactive login.
 			Name: "no_args",
-			Env:  nil,
+			Env: map[string]string{
+				"TS_AUTH_ONCE": "false",
+			},
+
 			Phases: []phase{
 				{
 					WantCmds: []string{
@@ -149,7 +152,8 @@ func TestContainerBoot(t *testing.T) {
 			// Userspace mode, ephemeral storage, authkey provided on every run.
 			Name: "authkey",
 			Env: map[string]string{
-				"TS_AUTHKEY": "tskey-key",
+				"TS_AUTHKEY":   "tskey-key",
+				"TS_AUTH_ONCE": "false",
 			},
 			Phases: []phase{
 				{
@@ -170,7 +174,8 @@ func TestContainerBoot(t *testing.T) {
 			// Userspace mode, ephemeral storage, authkey provided on every run.
 			Name: "authkey-old-flag",
 			Env: map[string]string{
-				"TS_AUTH_KEY": "tskey-key",
+				"TS_AUTH_KEY":  "tskey-key",
+				"TS_AUTH_ONCE": "false",
 			},
 			Phases: []phase{
 				{
@@ -192,6 +197,7 @@ func TestContainerBoot(t *testing.T) {
 			Env: map[string]string{
 				"TS_AUTHKEY":   "tskey-key",
 				"TS_STATE_DIR": filepath.Join(d, "tmp"),
+				"TS_AUTH_ONCE": "false",
 			},
 			Phases: []phase{
 				{
@@ -211,8 +217,9 @@ func TestContainerBoot(t *testing.T) {
 		{
 			Name: "routes",
 			Env: map[string]string{
-				"TS_AUTHKEY": "tskey-key",
-				"TS_ROUTES":  "1.2.3.0/24,10.20.30.0/24",
+				"TS_AUTHKEY":   "tskey-key",
+				"TS_ROUTES":    "1.2.3.0/24,10.20.30.0/24",
+				"TS_AUTH_ONCE": "false",
 			},
 			Phases: []phase{
 				{
@@ -239,6 +246,7 @@ func TestContainerBoot(t *testing.T) {
 				"TS_AUTHKEY":   "tskey-key",
 				"TS_ROUTES":    "1.2.3.0/24,10.20.30.0/24",
 				"TS_USERSPACE": "false",
+				"TS_AUTH_ONCE": "false",
 			},
 			Phases: []phase{
 				{
@@ -265,6 +273,7 @@ func TestContainerBoot(t *testing.T) {
 				"TS_AUTHKEY":   "tskey-key",
 				"TS_ROUTES":    "::/64,1::/64",
 				"TS_USERSPACE": "false",
+				"TS_AUTH_ONCE": "false",
 			},
 			Phases: []phase{
 				{
@@ -291,6 +300,7 @@ func TestContainerBoot(t *testing.T) {
 				"TS_AUTHKEY":   "tskey-key",
 				"TS_ROUTES":    "::/64,1.2.3.0/24",
 				"TS_USERSPACE": "false",
+				"TS_AUTH_ONCE": "false",
 			},
 			Phases: []phase{
 				{
@@ -312,11 +322,12 @@ func TestContainerBoot(t *testing.T) {
 			},
 		},
 		{
-			Name: "proxy",
+			Name: "ingres proxy",
 			Env: map[string]string{
 				"TS_AUTHKEY":   "tskey-key",
 				"TS_DEST_IP":   "1.2.3.4",
 				"TS_USERSPACE": "false",
+				"TS_AUTH_ONCE": "false",
 			},
 			Phases: []phase{
 				{
@@ -329,7 +340,29 @@ func TestContainerBoot(t *testing.T) {
 					Notify: runningNotify,
 					WantCmds: []string{
 						"/usr/bin/tailscale --socket=/tmp/tailscaled.sock set --accept-dns=false",
-						"/usr/bin/iptables -t nat -I PREROUTING 1 -d 100.64.0.1 -j DNAT --to-destination 1.2.3.4",
+					},
+				},
+			},
+		},
+		{
+			Name: "egress proxy",
+			Env: map[string]string{
+				"TS_AUTHKEY":           "tskey-key",
+				"TS_TAILNET_TARGET_IP": "100.99.99.99",
+				"TS_USERSPACE":         "false",
+				"TS_AUTH_ONCE":         "false",
+			},
+			Phases: []phase{
+				{
+					WantCmds: []string{
+						"/usr/bin/tailscaled --socket=/tmp/tailscaled.sock --state=mem: --statedir=/tmp",
+						"/usr/bin/tailscale --socket=/tmp/tailscaled.sock login --authkey=tskey-key",
+					},
+				},
+				{
+					Notify: runningNotify,
+					WantCmds: []string{
+						"/usr/bin/tailscale --socket=/tmp/tailscaled.sock set --accept-dns=false",
 					},
 				},
 			},
@@ -367,6 +400,7 @@ func TestContainerBoot(t *testing.T) {
 			Env: map[string]string{
 				"KUBERNETES_SERVICE_HOST":       kube.Host,
 				"KUBERNETES_SERVICE_PORT_HTTPS": kube.Port,
+				"TS_AUTH_ONCE":                  "false",
 			},
 			KubeSecret: map[string]string{
 				"authkey": "tskey-key",
@@ -404,6 +438,7 @@ func TestContainerBoot(t *testing.T) {
 				"TS_KUBE_SECRET": "",
 				"TS_STATE_DIR":   filepath.Join(d, "tmp"),
 				"TS_AUTHKEY":     "tskey-key",
+				"TS_AUTH_ONCE":   "false",
 			},
 			KubeSecret: map[string]string{},
 			Phases: []phase{
@@ -429,6 +464,7 @@ func TestContainerBoot(t *testing.T) {
 				"KUBERNETES_SERVICE_HOST":       kube.Host,
 				"KUBERNETES_SERVICE_PORT_HTTPS": kube.Port,
 				"TS_AUTHKEY":                    "tskey-key",
+				"TS_AUTH_ONCE":                  "false",
 			},
 			KubeSecret:    map[string]string{},
 			KubeDenyPatch: true,
@@ -498,6 +534,7 @@ func TestContainerBoot(t *testing.T) {
 			Env: map[string]string{
 				"KUBERNETES_SERVICE_HOST":       kube.Host,
 				"KUBERNETES_SERVICE_PORT_HTTPS": kube.Port,
+				"TS_AUTH_ONCE":                  "false",
 			},
 			KubeSecret: map[string]string{
 				"authkey": "tskey-key",
@@ -549,6 +586,7 @@ func TestContainerBoot(t *testing.T) {
 			Env: map[string]string{
 				"TS_SOCKS5_SERVER":              "localhost:1080",
 				"TS_OUTBOUND_HTTP_PROXY_LISTEN": "localhost:8080",
+				"TS_AUTH_ONCE":                  "false",
 			},
 			Phases: []phase{
 				{
@@ -569,6 +607,7 @@ func TestContainerBoot(t *testing.T) {
 			Name: "dns",
 			Env: map[string]string{
 				"TS_ACCEPT_DNS": "true",
+				"TS_AUTH_ONCE":  "false",
 			},
 			Phases: []phase{
 				{
@@ -590,6 +629,7 @@ func TestContainerBoot(t *testing.T) {
 			Env: map[string]string{
 				"TS_EXTRA_ARGS":            "--widget=rotated",
 				"TS_TAILSCALED_EXTRA_ARGS": "--experiments=widgets",
+				"TS_AUTH_ONCE":             "false",
 			},
 			Phases: []phase{
 				{
@@ -609,7 +649,8 @@ func TestContainerBoot(t *testing.T) {
 		{
 			Name: "hostname",
 			Env: map[string]string{
-				"TS_HOSTNAME": "my-server",
+				"TS_HOSTNAME":  "my-server",
+				"TS_AUTH_ONCE": "false",
 			},
 			Phases: []phase{
 				{
@@ -648,6 +689,7 @@ func TestContainerBoot(t *testing.T) {
 				fmt.Sprintf("TS_TEST_SOCKET=%s", lapi.Path),
 				fmt.Sprintf("TS_SOCKET=%s", runningSockPath),
 				fmt.Sprintf("TS_TEST_ONLY_ROOT=%s", d),
+				fmt.Sprint("TS_TEST_FAKE_NETFILTER=true"),
 			}
 			for k, v := range test.Env {
 				cmd.Env = append(cmd.Env, fmt.Sprintf("%s=%s", k, v))
@@ -663,7 +705,7 @@ func TestContainerBoot(t *testing.T) {
 				t.Fatalf("starting containerboot: %v", err)
 			}
 			defer func() {
-				cmd.Process.Signal(unix.SIGKILL)
+				cmd.Process.Signal(unix.SIGTERM)
 				cmd.Process.Wait()
 			}()
 

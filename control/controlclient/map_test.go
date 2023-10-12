@@ -16,9 +16,11 @@ import (
 
 	"github.com/google/go-cmp/cmp"
 	"go4.org/mem"
+	"tailscale.com/control/controlknobs"
 	"tailscale.com/tailcfg"
 	"tailscale.com/tstest"
 	"tailscale.com/tstime"
+	"tailscale.com/types/dnstype"
 	"tailscale.com/types/key"
 	"tailscale.com/types/logger"
 	"tailscale.com/types/netmap"
@@ -26,6 +28,14 @@ import (
 	"tailscale.com/util/mak"
 	"tailscale.com/util/must"
 )
+
+func eps(s ...string) []netip.AddrPort {
+	var eps []netip.AddrPort
+	for _, ep := range s {
+		eps = append(eps, netip.MustParseAddrPort(ep))
+	}
+	return eps
+}
 
 func TestUpdatePeersStateFromResponse(t *testing.T) {
 	var curTime time.Time
@@ -47,7 +57,7 @@ func TestUpdatePeersStateFromResponse(t *testing.T) {
 	}
 	withEP := func(ep string) func(*tailcfg.Node) {
 		return func(n *tailcfg.Node) {
-			n.Endpoints = []string{ep}
+			n.Endpoints = []netip.AddrPort{netip.MustParseAddrPort(ep)}
 		}
 	}
 	n := func(id tailcfg.NodeID, name string, mod ...func(*tailcfg.Node)) *tailcfg.Node {
@@ -195,7 +205,7 @@ func TestUpdatePeersStateFromResponse(t *testing.T) {
 			mapRes: &tailcfg.MapResponse{
 				PeersChangedPatch: []*tailcfg.PeerChange{{
 					NodeID:    1,
-					Endpoints: []string{"1.2.3.4:56"},
+					Endpoints: eps("1.2.3.4:56"),
 				}},
 			},
 			want:      peers(n(1, "foo", withEP("1.2.3.4:56"))),
@@ -207,7 +217,7 @@ func TestUpdatePeersStateFromResponse(t *testing.T) {
 			mapRes: &tailcfg.MapResponse{
 				PeersChangedPatch: []*tailcfg.PeerChange{{
 					NodeID:    1,
-					Endpoints: []string{"1.2.3.4:56"},
+					Endpoints: eps("1.2.3.4:56"),
 				}},
 			},
 			want:      peers(n(1, "foo", withDERP("127.3.3.40:3"), withEP("1.2.3.4:56"))),
@@ -220,7 +230,7 @@ func TestUpdatePeersStateFromResponse(t *testing.T) {
 				PeersChangedPatch: []*tailcfg.PeerChange{{
 					NodeID:     1,
 					DERPRegion: 2,
-					Endpoints:  []string{"1.2.3.4:56"},
+					Endpoints:  eps("1.2.3.4:56"),
 				}},
 			},
 			want:      peers(n(1, "foo", withDERP("127.3.3.40:2"), withEP("1.2.3.4:56"))),
@@ -327,13 +337,13 @@ func TestUpdatePeersStateFromResponse(t *testing.T) {
 			mapRes: &tailcfg.MapResponse{
 				PeersChangedPatch: []*tailcfg.PeerChange{{
 					NodeID:       1,
-					Capabilities: ptr.To([]string{"foo"}),
+					Capabilities: ptr.To([]tailcfg.NodeCapability{"foo"}),
 				}},
 			},
 			want: peers(&tailcfg.Node{
 				ID:           1,
 				Name:         "foo",
-				Capabilities: []string{"foo"},
+				Capabilities: []tailcfg.NodeCapability{"foo"},
 			}),
 			wantStats: updateStats{changed: 1},
 		}}
@@ -392,7 +402,7 @@ func formatNodes(nodes []*tailcfg.Node) string {
 }
 
 func newTestMapSession(t testing.TB, nu NetmapUpdater) *mapSession {
-	ms := newMapSession(key.NewNode(), nu)
+	ms := newMapSession(key.NewNode(), nu, new(controlknobs.Knobs))
 	t.Cleanup(ms.Close)
 	ms.logf = t.Logf
 	return ms
@@ -665,9 +675,9 @@ func TestPeerChangeDiff(t *testing.T) {
 		},
 		{
 			name: "patch-endpoints",
-			a:    &tailcfg.Node{ID: 1, Endpoints: []string{"10.0.0.1:1"}},
-			b:    &tailcfg.Node{ID: 1, Endpoints: []string{"10.0.0.2:2"}},
-			want: &tailcfg.PeerChange{NodeID: 1, Endpoints: []string{"10.0.0.2:2"}},
+			a:    &tailcfg.Node{ID: 1, Endpoints: eps("10.0.0.1:1")},
+			b:    &tailcfg.Node{ID: 1, Endpoints: eps("10.0.0.2:2")},
+			want: &tailcfg.PeerChange{NodeID: 1, Endpoints: eps("10.0.0.2:2")},
 		},
 		{
 			name: "patch-cap",
@@ -683,15 +693,15 @@ func TestPeerChangeDiff(t *testing.T) {
 		},
 		{
 			name: "patch-capabilities-to-nonempty",
-			a:    &tailcfg.Node{ID: 1, Capabilities: []string{"foo"}},
-			b:    &tailcfg.Node{ID: 1, Capabilities: []string{"bar"}},
-			want: &tailcfg.PeerChange{NodeID: 1, Capabilities: ptr.To([]string{"bar"})},
+			a:    &tailcfg.Node{ID: 1, Capabilities: []tailcfg.NodeCapability{"foo"}},
+			b:    &tailcfg.Node{ID: 1, Capabilities: []tailcfg.NodeCapability{"bar"}},
+			want: &tailcfg.PeerChange{NodeID: 1, Capabilities: ptr.To([]tailcfg.NodeCapability{"bar"})},
 		},
 		{
 			name: "patch-capabilities-to-empty",
-			a:    &tailcfg.Node{ID: 1, Capabilities: []string{"foo"}},
+			a:    &tailcfg.Node{ID: 1, Capabilities: []tailcfg.NodeCapability{"foo"}},
 			b:    &tailcfg.Node{ID: 1},
-			want: &tailcfg.PeerChange{NodeID: 1, Capabilities: ptr.To([]string(nil))},
+			want: &tailcfg.PeerChange{NodeID: 1, Capabilities: ptr.To([]tailcfg.NodeCapability(nil))},
 		},
 		{
 			name: "patch-online-to-true",
@@ -733,6 +743,18 @@ func TestPeerChangeDiff(t *testing.T) {
 			name: "miss-change-user",
 			a:    &tailcfg.Node{ID: 1, User: 1},
 			b:    &tailcfg.Node{ID: 1, User: 2},
+			want: nil,
+		},
+		{
+			name: "miss-change-masq-v4",
+			a:    &tailcfg.Node{ID: 1, SelfNodeV4MasqAddrForThisPeer: ptr.To(netip.MustParseAddr("100.64.0.1"))},
+			b:    &tailcfg.Node{ID: 1, SelfNodeV4MasqAddrForThisPeer: ptr.To(netip.MustParseAddr("100.64.0.2"))},
+			want: nil,
+		},
+		{
+			name: "miss-change-masq-v6",
+			a:    &tailcfg.Node{ID: 1, SelfNodeV6MasqAddrForThisPeer: ptr.To(netip.MustParseAddr("2001::3456"))},
+			b:    &tailcfg.Node{ID: 1, SelfNodeV6MasqAddrForThisPeer: ptr.To(netip.MustParseAddr("2001::3006"))},
 			want: nil,
 		}}
 	for _, tt := range tests {
@@ -795,13 +817,13 @@ func TestPatchifyPeersChanged(t *testing.T) {
 			},
 			mr1: &tailcfg.MapResponse{
 				PeersChanged: []*tailcfg.Node{
-					{ID: 1, Endpoints: []string{"10.0.0.1:1111"}, Hostinfo: hi},
+					{ID: 1, Endpoints: eps("10.0.0.1:1111"), Hostinfo: hi},
 				},
 			},
 			want: &tailcfg.MapResponse{
 				PeersChanged: nil,
 				PeersChangedPatch: []*tailcfg.PeerChange{
-					{NodeID: 1, Endpoints: []string{"10.0.0.1:1111"}},
+					{NodeID: 1, Endpoints: eps("10.0.0.1:1111")},
 				},
 			},
 		},
@@ -834,6 +856,40 @@ func TestPatchifyPeersChanged(t *testing.T) {
 				},
 			},
 		},
+		{
+			name: "change_exitnodednsresolvers",
+			mr0: &tailcfg.MapResponse{
+				Node: &tailcfg.Node{Name: "foo.bar.ts.net."},
+				Peers: []*tailcfg.Node{
+					{ID: 1, ExitNodeDNSResolvers: []*dnstype.Resolver{{Addr: "dns.exmaple.com"}}, Hostinfo: hi},
+				},
+			},
+			mr1: &tailcfg.MapResponse{
+				PeersChanged: []*tailcfg.Node{
+					{ID: 1, ExitNodeDNSResolvers: []*dnstype.Resolver{{Addr: "dns2.exmaple.com"}}, Hostinfo: hi},
+				},
+			},
+			want: &tailcfg.MapResponse{
+				PeersChanged: []*tailcfg.Node{
+					{ID: 1, ExitNodeDNSResolvers: []*dnstype.Resolver{{Addr: "dns2.exmaple.com"}}, Hostinfo: hi},
+				},
+			},
+		},
+		{
+			name: "same_exitnoderesolvers",
+			mr0: &tailcfg.MapResponse{
+				Node: &tailcfg.Node{Name: "foo.bar.ts.net."},
+				Peers: []*tailcfg.Node{
+					{ID: 1, ExitNodeDNSResolvers: []*dnstype.Resolver{{Addr: "dns.exmaple.com"}}, Hostinfo: hi},
+				},
+			},
+			mr1: &tailcfg.MapResponse{
+				PeersChanged: []*tailcfg.Node{
+					{ID: 1, ExitNodeDNSResolvers: []*dnstype.Resolver{{Addr: "dns.exmaple.com"}}, Hostinfo: hi},
+				},
+			},
+			want: &tailcfg.MapResponse{},
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -843,7 +899,10 @@ func TestPatchifyPeersChanged(t *testing.T) {
 			mr1 := new(tailcfg.MapResponse)
 			must.Do(json.Unmarshal(must.Get(json.Marshal(tt.mr1)), mr1))
 			ms.patchifyPeersChanged(mr1)
-			if diff := cmp.Diff(tt.want, mr1); diff != "" {
+			opts := []cmp.Option{
+				cmp.Comparer(func(a, b netip.AddrPort) bool { return a == b }),
+			}
+			if diff := cmp.Diff(tt.want, mr1, opts...); diff != "" {
 				t.Errorf("wrong result (-want +got):\n%s", diff)
 			}
 		})
@@ -869,7 +928,7 @@ func BenchmarkMapSessionDelta(b *testing.B) {
 					DERP:       "127.3.3.40:10",
 					Addresses:  []netip.Prefix{netip.MustParsePrefix("100.100.2.3/32"), netip.MustParsePrefix("fd7a:115c:a1e0::123/128")},
 					AllowedIPs: []netip.Prefix{netip.MustParsePrefix("100.100.2.3/32"), netip.MustParsePrefix("fd7a:115c:a1e0::123/128")},
-					Endpoints:  []string{"192.168.1.2:345", "192.168.1.3:678"},
+					Endpoints:  eps("192.168.1.2:345", "192.168.1.3:678"),
 					Hostinfo: (&tailcfg.Hostinfo{
 						OS:       "fooOS",
 						Hostname: "MyHostname",

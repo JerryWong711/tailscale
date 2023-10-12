@@ -11,6 +11,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/xml"
 	"fmt"
 	"io"
 	"math/rand"
@@ -24,7 +25,8 @@ import (
 
 	"github.com/tailscale/goupnp"
 	"github.com/tailscale/goupnp/dcps/internetgateway2"
-	"tailscale.com/control/controlknobs"
+	"github.com/tailscale/goupnp/soap"
+	"tailscale.com/envknob"
 	"tailscale.com/net/netns"
 	"tailscale.com/types/logger"
 )
@@ -192,7 +194,7 @@ func addAnyPortMapping(
 // The provided ctx is not retained in the returned upnpClient, but
 // its associated HTTP client is (if set via goupnp.WithHTTPClient).
 func getUPnPClient(ctx context.Context, logf logger.Logf, debug DebugKnobs, gw netip.Addr, meta uPnPDiscoResponse) (client upnpClient, err error) {
-	if controlknobs.DisableUPnP() || debug.DisableUPnP {
+	if debug.DisableUPnP {
 		return nil, nil
 	}
 
@@ -270,6 +272,10 @@ func (c *Client) upnpHTTPClientLocked() *http.Client {
 	return c.uPnPHTTPClient
 }
 
+var (
+	disableUPnpEnv = envknob.RegisterBool("TS_DISABLE_UPNP")
+)
+
 // getUPnPPortMapping attempts to create a port-mapping over the UPnP protocol. On success,
 // it will return the externally exposed IP and port. Otherwise, it will return a zeroed IP and
 // port and an error.
@@ -279,7 +285,7 @@ func (c *Client) getUPnPPortMapping(
 	internal netip.AddrPort,
 	prevPort uint16,
 ) (external netip.AddrPort, ok bool) {
-	if controlknobs.DisableUPnP() || c.debug.DisableUPnP {
+	if disableUPnpEnv() || c.debug.DisableUPnP || (c.controlKnobs != nil && c.controlKnobs.DisableUPnP.Load()) {
 		return netip.AddrPort{}, false
 	}
 
@@ -312,6 +318,7 @@ func (c *Client) getUPnPPortMapping(
 		return netip.AddrPort{}, false
 	}
 
+	// Start by trying to make a temporary lease with a duration.
 	var newPort uint16
 	newPort, err = addAnyPortMapping(
 		ctx,
@@ -319,14 +326,42 @@ func (c *Client) getUPnPPortMapping(
 		prevPort,
 		internal.Port(),
 		internal.Addr().String(),
-		time.Second*pmpMapLifetimeSec,
+		pmpMapLifetimeSec*time.Second,
 	)
 	if c.debug.VerboseLogs {
 		c.logf("addAnyPortMapping: %v, err=%q", newPort, err)
 	}
+
+	// If this is an error and the code is
+	// "OnlyPermanentLeasesSupported", then we retry with no lease
+	// duration; see the following issue for details:
+	//    https://github.com/tailscale/tailscale/issues/9343
+	if err != nil {
+		code, ok := getUPnPErrorCode(err)
+		if ok {
+			getUPnPErrorsMetric(code).Add(1)
+		}
+
+		// From the UPnP spec: http://upnp.org/specs/gw/UPnP-gw-WANIPConnection-v2-Service.pdf
+		//     725: OnlyPermanentLeasesSupported
+		if ok && code == 725 {
+			newPort, err = addAnyPortMapping(
+				ctx,
+				client,
+				prevPort,
+				internal.Port(),
+				internal.Addr().String(),
+				0, // permanent
+			)
+			if c.debug.VerboseLogs {
+				c.logf("addAnyPortMapping: 725 retry %v, err=%q", newPort, err)
+			}
+		}
+	}
 	if err != nil {
 		return netip.AddrPort{}, false
 	}
+
 	// TODO cache this ip somewhere?
 	extIP, err := client.GetExternalIPAddress(ctx)
 	if c.debug.VerboseLogs {
@@ -342,6 +377,10 @@ func (c *Client) getUPnPPortMapping(
 	}
 
 	upnp.external = netip.AddrPortFrom(externalIP, newPort)
+
+	// NOTE: this time might not technically be accurate if we created a
+	// permanent lease above, but we should still re-check the presence of
+	// the lease on a regular basis so we use it anyway.
 	d := time.Duration(pmpMapLifetimeSec) * time.Second
 	upnp.goodUntil = now.Add(d)
 	upnp.renewAfter = now.Add(d / 2)
@@ -351,6 +390,29 @@ func (c *Client) getUPnPPortMapping(
 	c.mapping = upnp
 	c.localPort = newPort
 	return upnp.external, true
+}
+
+// getUPnPErrorCode returns the UPnP error code from the given response, if the
+// error is a SOAP error in the proper format, and a boolean indicating whether
+// the provided error was actually a UPnP error.
+func getUPnPErrorCode(err error) (int, bool) {
+	soapErr, ok := err.(*soap.SOAPFaultError)
+	if !ok {
+		return 0, false
+	}
+
+	var upnpErr struct {
+		XMLName     xml.Name
+		Code        int    `xml:"errorCode"`
+		Description string `xml:"errorDescription"`
+	}
+	if err := xml.Unmarshal([]byte(soapErr.Detail.Raw), &upnpErr); err != nil {
+		return 0, false
+	}
+	if upnpErr.XMLName.Local != "UPnPError" {
+		return 0, false
+	}
+	return upnpErr.Code, true
 }
 
 type uPnPDiscoResponse struct {

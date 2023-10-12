@@ -7,7 +7,7 @@ package localapi
 import (
 	"bytes"
 	"context"
-	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -36,7 +36,6 @@ import (
 	"tailscale.com/net/netmon"
 	"tailscale.com/net/netutil"
 	"tailscale.com/net/portmapper"
-	"tailscale.com/net/tstun"
 	"tailscale.com/tailcfg"
 	"tailscale.com/tka"
 	"tailscale.com/tstime"
@@ -49,7 +48,9 @@ import (
 	"tailscale.com/util/httpm"
 	"tailscale.com/util/mak"
 	"tailscale.com/util/osdiag"
+	"tailscale.com/util/rands"
 	"tailscale.com/version"
+	"tailscale.com/wgengine/magicsock"
 )
 
 type localAPIHandler func(*Handler, http.ResponseWriter, *http.Request)
@@ -98,7 +99,6 @@ var handler = map[string]localAPIHandler{
 	"set-expiry-sooner":           (*Handler).serveSetExpirySooner,
 	"start":                       (*Handler).serveStart,
 	"status":                      (*Handler).serveStatus,
-	"stream-serve":                (*Handler).serveStreamServe,
 	"tka/init":                    (*Handler).serveTKAInit,
 	"tka/log":                     (*Handler).serveTKALog,
 	"tka/modify":                  (*Handler).serveTKAModify,
@@ -116,12 +116,6 @@ var handler = map[string]localAPIHandler{
 	"watch-ipn-bus":               (*Handler).serveWatchIPNBus,
 	"whois":                       (*Handler).serveWhoIs,
 	"query-feature":               (*Handler).serveQueryFeature,
-}
-
-func randHex(n int) string {
-	b := make([]byte, n)
-	rand.Read(b)
-	return hex.EncodeToString(b)
 }
 
 var (
@@ -318,7 +312,7 @@ func (h *Handler) serveBugReport(w http.ResponseWriter, r *http.Request) {
 	defer h.b.TryFlushLogs() // kick off upload after bugreport's done logging
 
 	logMarker := func() string {
-		return fmt.Sprintf("BUG-%v-%v-%v", h.backendLogID, h.clock.Now().UTC().Format("20060102150405Z"), randHex(8))
+		return fmt.Sprintf("BUG-%v-%v-%v", h.backendLogID, h.clock.Now().UTC().Format("20060102150405Z"), rands.HexString(16))
 	}
 	if envknob.NoLogsNoSupport() {
 		logMarker = func() string { return "BUG-NO-LOGS-NO-SUPPORT-this-node-has-had-its-logging-disabled" }
@@ -414,18 +408,32 @@ func (h *Handler) serveBugReport(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) serveWhoIs(w http.ResponseWriter, r *http.Request) {
+	h.serveWhoIsWithBackend(w, r, h.b)
+}
+
+// localBackendWhoIsMethods is the subset of ipn.LocalBackend as needed
+// by the localapi WhoIs method.
+type localBackendWhoIsMethods interface {
+	WhoIs(netip.AddrPort) (n tailcfg.NodeView, u tailcfg.UserProfile, ok bool)
+	PeerCaps(netip.Addr) tailcfg.PeerCapMap
+}
+
+func (h *Handler) serveWhoIsWithBackend(w http.ResponseWriter, r *http.Request, b localBackendWhoIsMethods) {
 	if !h.PermitRead {
 		http.Error(w, "whois access denied", http.StatusForbidden)
 		return
 	}
-	b := h.b
 	var ipp netip.AddrPort
 	if v := r.FormValue("addr"); v != "" {
-		var err error
-		ipp, err = netip.ParseAddrPort(v)
-		if err != nil {
-			http.Error(w, "invalid 'addr' parameter", 400)
-			return
+		if ip, err := netip.ParseAddr(v); err == nil {
+			ipp = netip.AddrPortFrom(ip, 0)
+		} else {
+			var err error
+			ipp, err = netip.ParseAddrPort(v)
+			if err != nil {
+				http.Error(w, "invalid 'addr' parameter", 400)
+				return
+			}
 		}
 	} else {
 		http.Error(w, "missing 'addr' parameter", 400)
@@ -439,7 +447,9 @@ func (h *Handler) serveWhoIs(w http.ResponseWriter, r *http.Request) {
 	res := &apitype.WhoIsResponse{
 		Node:        n.AsStruct(), // always non-nil per WhoIsResponse contract
 		UserProfile: &u,           // always non-nil per WhoIsResponse contract
-		CapMap:      b.PeerCaps(ipp.Addr()),
+	}
+	if n.Addresses().Len() > 0 {
+		res.CapMap = b.PeerCaps(n.Addresses().At(0).Addr())
 	}
 	j, err := json.MarshalIndent(res, "", "\t")
 	if err != nil {
@@ -563,6 +573,17 @@ func (h *Handler) serveDebug(w http.ResponseWriter, r *http.Request) {
 		err = h.b.DebugBreakTCPConns()
 	case "break-derp-conns":
 		err = h.b.DebugBreakDERPConns()
+	case "force-netmap-update":
+		h.b.DebugForceNetmapUpdate()
+	case "control-knobs":
+		k := h.b.ControlKnobs()
+		w.Header().Set("Content-Type", "application/json")
+		err = json.NewEncoder(w).Encode(k.AsDebugJSON())
+		if err == nil {
+			return
+		}
+	case "pick-new-derp":
+		err = h.b.DebugPickNewDERP()
 	case "":
 		err = fmt.Errorf("missing parameter 'action'")
 	default:
@@ -702,7 +723,7 @@ func (h *Handler) serveDebugPortmap(w http.ResponseWriter, r *http.Request) {
 	done := make(chan bool, 1)
 
 	var c *portmapper.Client
-	c = portmapper.NewClient(logger.WithPrefix(logf, "portmapper: "), h.netMon, debugKnobs, func() {
+	c = portmapper.NewClient(logger.WithPrefix(logf, "portmapper: "), h.netMon, debugKnobs, h.b.ControlKnobs(), func() {
 		logf("portmapping changed.")
 		logf("have mapping: %v", c.HaveMapping())
 
@@ -838,9 +859,17 @@ func (h *Handler) serveServeConfig(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "serve config denied", http.StatusForbidden)
 			return
 		}
-		w.Header().Set("Content-Type", "application/json")
 		config := h.b.ServeConfig()
-		json.NewEncoder(w).Encode(config)
+		bts, err := json.Marshal(config)
+		if err != nil {
+			http.Error(w, "error encoding config: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+		sum := sha256.Sum256(bts)
+		etag := hex.EncodeToString(sum[:])
+		w.Header().Set("Etag", etag)
+		w.Header().Set("Content-Type", "application/json")
+		w.Write(bts)
 	case "POST":
 		if !h.PermitWrite {
 			http.Error(w, "serve config denied", http.StatusForbidden)
@@ -851,7 +880,12 @@ func (h *Handler) serveServeConfig(w http.ResponseWriter, r *http.Request) {
 			writeErrorJSON(w, fmt.Errorf("decoding config: %w", err))
 			return
 		}
-		if err := h.b.SetServeConfig(configIn); err != nil {
+		etag := r.Header.Get("If-Match")
+		if err := h.b.SetServeConfig(configIn, etag); err != nil {
+			if errors.Is(err, ipnlocal.ErrETagMismatch) {
+				http.Error(w, err.Error(), http.StatusPreconditionFailed)
+				return
+			}
 			writeErrorJSON(w, fmt.Errorf("updating config: %w", err))
 			return
 		}
@@ -859,31 +893,6 @@ func (h *Handler) serveServeConfig(w http.ResponseWriter, r *http.Request) {
 	default:
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 	}
-}
-
-// serveStreamServe handles foreground serve and funnel streams. This is
-// currently in development per https://github.com/tailscale/tailscale/issues/8489
-func (h *Handler) serveStreamServe(w http.ResponseWriter, r *http.Request) {
-	if !h.PermitWrite {
-		// Write permission required because we modify the ServeConfig.
-		http.Error(w, "serve stream denied", http.StatusForbidden)
-		return
-	}
-	if r.Method != "POST" {
-		http.Error(w, "POST required", http.StatusMethodNotAllowed)
-		return
-	}
-	var req ipn.ServeStreamRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeErrorJSON(w, fmt.Errorf("decoding HostPort: %w", err))
-		return
-	}
-	w.Header().Set("Content-Type", "application/json")
-	if err := h.b.StreamServe(r.Context(), w, req); err != nil {
-		writeErrorJSON(w, fmt.Errorf("streaming serve: %w", err))
-		return
-	}
-	w.WriteHeader(http.StatusOK)
 }
 
 func (h *Handler) serveCheckIPForwarding(w http.ResponseWriter, r *http.Request) {
@@ -1056,7 +1065,7 @@ func (h *Handler) serveLogout(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "want POST", 400)
 		return
 	}
-	err := h.b.LogoutSync(r.Context())
+	err := h.b.Logout(r.Context())
 	if err == nil {
 		w.WriteHeader(http.StatusNoContent)
 		return
@@ -1391,8 +1400,8 @@ func (h *Handler) servePing(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "'size' parameter is only supported with disco pings", 400)
 			return
 		}
-		if size > int(tstun.DefaultMTU()) {
-			http.Error(w, fmt.Sprintf("maximum value for 'size' is %v", tstun.DefaultMTU()), 400)
+		if size > magicsock.MaxDiscoPingSize {
+			http.Error(w, fmt.Sprintf("maximum value for 'size' is %v", magicsock.MaxDiscoPingSize), 400)
 			return
 		}
 	}

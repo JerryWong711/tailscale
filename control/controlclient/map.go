@@ -14,7 +14,9 @@ import (
 	"sort"
 	"strconv"
 	"sync"
+	"time"
 
+	"tailscale.com/control/controlknobs"
 	"tailscale.com/envknob"
 	"tailscale.com/tailcfg"
 	"tailscale.com/tstime"
@@ -38,7 +40,8 @@ import (
 // one MapRequest).
 type mapSession struct {
 	// Immutable fields.
-	nu             NetmapUpdater // called on changes (in addition to the optional hooks below)
+	netmapUpdater  NetmapUpdater       // called on changes (in addition to the optional hooks below)
+	controlKnobs   *controlknobs.Knobs // or nil
 	privateNodeKey key.NodePrivate
 	publicNodeKey  key.NodePublic
 	logf           logger.Logf
@@ -94,9 +97,10 @@ type mapSession struct {
 // Modify its optional fields on the returned value before use.
 //
 // It must have its Close method called to release resources.
-func newMapSession(privateNodeKey key.NodePrivate, nu NetmapUpdater) *mapSession {
+func newMapSession(privateNodeKey key.NodePrivate, nu NetmapUpdater, controlKnobs *controlknobs.Knobs) *mapSession {
 	ms := &mapSession{
-		nu:              nu,
+		netmapUpdater:   nu,
+		controlKnobs:    controlKnobs,
 		privateNodeKey:  privateNodeKey,
 		publicNodeKey:   privateNodeKey.Public(),
 		lastDNSConfig:   new(tailcfg.DNSConfig),
@@ -183,8 +187,9 @@ func (ms *mapSession) HandleNonKeepAliveMapResponse(ctx context.Context, resp *t
 	if resp.Node != nil {
 		if DevKnob.StripCaps() {
 			resp.Node.Capabilities = nil
+			resp.Node.CapMap = nil
 		}
-		setControlKnobsFromNodeAttrs(resp.Node.Capabilities)
+		ms.controlKnobs.UpdateFromNodeAttributes(resp.Node.Capabilities, resp.Node.CapMap)
 	}
 
 	// Call Node.InitDisplayNames on any changed nodes.
@@ -194,8 +199,16 @@ func (ms *mapSession) HandleNonKeepAliveMapResponse(ctx context.Context, resp *t
 
 	ms.updateStateFromResponse(resp)
 
-	nm := ms.netmap()
+	if ms.tryHandleIncrementally(resp) {
+		ms.onConciseNetMapSummary(ms.lastNetmapSummary) // every 5s log
+		return nil
+	}
 
+	// We have to rebuild the whole netmap (lots of garbage & work downstream of
+	// our UpdateFullNetmap call). This is the part we tried to avoid but
+	// some field mutations (especially rare ones) aren't yet handled.
+
+	nm := ms.netmap()
 	ms.lastNetmapSummary = nm.VeryConcise()
 	ms.onConciseNetMapSummary(ms.lastNetmapSummary)
 
@@ -204,8 +217,23 @@ func (ms *mapSession) HandleNonKeepAliveMapResponse(ctx context.Context, resp *t
 		ms.onSelfNodeChanged(nm)
 	}
 
-	ms.nu.UpdateFullNetmap(nm)
+	ms.netmapUpdater.UpdateFullNetmap(nm)
 	return nil
+}
+
+func (ms *mapSession) tryHandleIncrementally(res *tailcfg.MapResponse) bool {
+	if ms.controlKnobs != nil && ms.controlKnobs.DisableDeltaUpdates.Load() {
+		return false
+	}
+	nud, ok := ms.netmapUpdater.(NetmapDeltaUpdater)
+	if !ok {
+		return false
+	}
+	mutations, ok := netmap.MutationsFromMapResponse(res, time.Now())
+	if ok && len(mutations) > 0 {
+		return nud.UpdateNetmapDelta(mutations)
+	}
+	return ok
 }
 
 // updateStats are some stats from updateStateFromResponse, primarily for
@@ -297,6 +325,7 @@ var (
 	patchLastSeen     = clientmetric.NewCounter("controlclient_patch_lastseen")
 	patchKeyExpiry    = clientmetric.NewCounter("controlclient_patch_keyexpiry")
 	patchCapabilities = clientmetric.NewCounter("controlclient_patch_capabilities")
+	patchCapMap       = clientmetric.NewCounter("controlclient_patch_capmap")
 	patchKeySignature = clientmetric.NewCounter("controlclient_patch_keysig")
 
 	patchifiedPeer      = clientmetric.NewCounter("controlclient_patchified_peer")
@@ -424,6 +453,10 @@ func (ms *mapSession) updatePeersStateFromResponse(resp *tailcfg.MapResponse) (s
 		if v := pc.KeySignature; v != nil {
 			mut.KeySignature = v
 			patchKeySignature.Add(1)
+		}
+		if v := pc.CapMap; v != nil {
+			mut.CapMap = v
+			patchCapMap.Add(1)
 		}
 		*vp = mut.View()
 	}
@@ -620,6 +653,10 @@ func peerChangeDiff(was tailcfg.NodeView, n *tailcfg.Node) (_ *tailcfg.PeerChang
 			if was.Cap() != n.Cap {
 				pc().Cap = n.Cap
 			}
+		case "CapMap":
+			if n.CapMap != nil {
+				pc().CapMap = n.CapMap
+			}
 		case "Tags":
 			if !views.SliceEqual(was.Tags(), views.SliceOf(n.Tags)) {
 				return nil, false
@@ -666,6 +703,27 @@ func peerChangeDiff(was tailcfg.NodeView, n *tailcfg.Node) (_ *tailcfg.PeerChang
 			if va == nil || vb == nil || *va != *vb {
 				return nil, false
 			}
+		case "SelfNodeV6MasqAddrForThisPeer":
+			va, vb := was.SelfNodeV6MasqAddrForThisPeer(), n.SelfNodeV6MasqAddrForThisPeer
+			if va == nil && vb == nil {
+				continue
+			}
+			if va == nil || vb == nil || *va != *vb {
+				return nil, false
+			}
+		case "ExitNodeDNSResolvers":
+			va, vb := was.ExitNodeDNSResolvers(), views.SliceOfViews(n.ExitNodeDNSResolvers)
+
+			if va.Len() != vb.Len() {
+				return nil, false
+			}
+
+			for i := range va.LenIter() {
+				if !va.At(i).Equal(vb.At(i)) {
+					return nil, false
+				}
+			}
+
 		}
 	}
 	if ret != nil {
@@ -712,12 +770,6 @@ func (ms *mapSession) netmap() *netmap.NetworkMap {
 		nm.SelfNode = node
 		nm.Expiry = node.KeyExpiry()
 		nm.Name = node.Name()
-		nm.Addresses = filterSelfAddresses(node.Addresses().AsSlice())
-		if node.MachineAuthorized() {
-			nm.MachineStatus = tailcfg.MachineAuthorized
-		} else {
-			nm.MachineStatus = tailcfg.MachineUnauthorized
-		}
 	}
 
 	ms.addUserProfile(nm, nm.User())

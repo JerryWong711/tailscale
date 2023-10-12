@@ -16,6 +16,7 @@ import (
 
 	"tailscale.com/net/interfaces"
 	"tailscale.com/types/logger"
+	"tailscale.com/util/clientmetric"
 	"tailscale.com/util/set"
 )
 
@@ -173,8 +174,14 @@ func (m *Monitor) GatewayAndSelfIP() (gw, myIP netip.Addr, ok bool) {
 		return m.gw, m.gwSelfIP, true
 	}
 	gw, myIP, ok = interfaces.LikelyHomeRouterIP()
+	changed := false
 	if ok {
-		m.gw, m.gwSelfIP, m.gwValid = gw, myIP, true
+		changed = m.gw != gw || m.gwSelfIP != myIP
+		m.gw, m.gwSelfIP = gw, myIP
+		m.gwValid = true
+	}
+	if changed {
+		m.logf("gateway and self IP changed: gw=%v self=%v", m.gw, m.gwSelfIP)
 	}
 	return gw, myIP, ok
 }
@@ -369,6 +376,13 @@ func (m *Monitor) debounce() {
 	}
 }
 
+var (
+	metricChangeEq       = clientmetric.NewCounter("netmon_link_change_eq")
+	metricChange         = clientmetric.NewCounter("netmon_link_change")
+	metricChangeTimeJump = clientmetric.NewCounter("netmon_link_change_timejump")
+	metricChangeMajor    = clientmetric.NewCounter("netmon_link_change_major")
+)
+
 // handlePotentialChange considers whether newState is different enough to wake
 // up callers and updates the monitor's state if so.
 //
@@ -380,6 +394,7 @@ func (m *Monitor) handlePotentialChange(newState *interfaces.State, forceCallbac
 	timeJumped := shouldMonitorTimeJump && m.checkWallTimeAdvanceLocked()
 	if !timeJumped && !forceCallbacks && oldState.Equal(newState) {
 		// Exactly equal. Nothing to do.
+		metricChangeEq.Add(1)
 		return
 	}
 
@@ -409,6 +424,13 @@ func (m *Monitor) handlePotentialChange(newState *interfaces.State, forceCallbac
 			m.logf("time jumped (probably wake from sleep); synthesizing major change event")
 			delta.Major = true
 		}
+	}
+	metricChange.Add(1)
+	if delta.Major {
+		metricChangeMajor.Add(1)
+	}
+	if delta.TimeJumped {
+		metricChangeTimeJump.Add(1)
 	}
 	for _, cb := range m.cbs {
 		go cb(delta)

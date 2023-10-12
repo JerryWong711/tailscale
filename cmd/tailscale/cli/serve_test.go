@@ -9,7 +9,6 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -339,19 +338,19 @@ func TestServeConfigMutations(t *testing.T) {
 	add(step{reset: true})
 	add(step{ // must include scheme for tcp
 		command: cmd("tls-terminated-tcp:443 localhost:5432"),
-		wantErr: exactErr(flag.ErrHelp, "flag.ErrHelp"),
+		wantErr: exactErr(errHelp, "errHelp"),
 	})
 	add(step{ // !somehost, must be localhost or 127.0.0.1
 		command: cmd("tls-terminated-tcp:443 tcp://somehost:5432"),
-		wantErr: exactErr(flag.ErrHelp, "flag.ErrHelp"),
+		wantErr: exactErr(errHelp, "errHelp"),
 	})
 	add(step{ // bad target port, too low
 		command: cmd("tls-terminated-tcp:443 tcp://somehost:0"),
-		wantErr: exactErr(flag.ErrHelp, "flag.ErrHelp"),
+		wantErr: exactErr(errHelp, "errHelp"),
 	})
 	add(step{ // bad target port, too high
 		command: cmd("tls-terminated-tcp:443 tcp://somehost:65536"),
-		wantErr: exactErr(flag.ErrHelp, "flag.ErrHelp"),
+		wantErr: exactErr(errHelp, "errHelp"),
 	})
 	add(step{
 		command: cmd("tls-terminated-tcp:443 tcp://localhost:5432"),
@@ -472,7 +471,7 @@ func TestServeConfigMutations(t *testing.T) {
 	})
 	add(step{ // bad path
 		command: cmd("https:443 / bad/path"),
-		wantErr: exactErr(flag.ErrHelp, "flag.ErrHelp"),
+		wantErr: exactErr(errHelp, "errHelp"),
 	})
 	add(step{reset: true})
 	add(step{
@@ -666,7 +665,7 @@ func TestServeConfigMutations(t *testing.T) {
 	})
 	add(step{ // try to start a web handler on the same port
 		command: cmd("https:443 / localhost:3000"),
-		wantErr: exactErr(flag.ErrHelp, "flag.ErrHelp"),
+		wantErr: exactErr(errHelp, "errHelp"),
 	})
 	add(step{reset: true})
 	add(step{ // start a web handler on port 443
@@ -764,7 +763,7 @@ func TestVerifyFunnelEnabled(t *testing.T) {
 		// queryFeatureResponse is the mock response desired from the
 		// call made to lc.QueryFeature by verifyFunnelEnabled.
 		queryFeatureResponse mockQueryFeatureResponse
-		caps                 []string // optionally set at fakeStatus.Capabilities
+		caps                 []tailcfg.NodeCapability // optionally set at fakeStatus.Capabilities
 		wantErr              string
 		wantPanic            string
 	}{
@@ -781,13 +780,13 @@ func TestVerifyFunnelEnabled(t *testing.T) {
 		{
 			name:                 "fallback-flow-missing-acl-rule",
 			queryFeatureResponse: mockQueryFeatureResponse{resp: nil, err: errors.New("not-allowed")},
-			caps:                 []string{tailcfg.CapabilityHTTPS},
+			caps:                 []tailcfg.NodeCapability{tailcfg.CapabilityHTTPS},
 			wantErr:              `Funnel not available; "funnel" node attribute not set. See https://tailscale.com/s/no-funnel.`,
 		},
 		{
 			name:                 "fallback-flow-enabled",
 			queryFeatureResponse: mockQueryFeatureResponse{resp: nil, err: errors.New("not-allowed")},
-			caps:                 []string{tailcfg.CapabilityHTTPS, tailcfg.NodeAttrFunnel},
+			caps:                 []tailcfg.NodeCapability{tailcfg.CapabilityHTTPS, tailcfg.NodeAttrFunnel},
 			wantErr:              "", // no error, success
 		},
 		{
@@ -859,7 +858,7 @@ var fakeStatus = &ipnstate.Status{
 	BackendState: ipn.Running.String(),
 	Self: &ipnstate.PeerStatus{
 		DNSName:      "foo.test.ts.net",
-		Capabilities: []string{tailcfg.NodeAttrFunnel, tailcfg.CapabilityFunnelPorts + "?ports=443,8443"},
+		Capabilities: []tailcfg.NodeCapability{tailcfg.NodeAttrFunnel, tailcfg.CapabilityFunnelPorts + "?ports=443,8443"},
 	},
 }
 
@@ -900,11 +899,6 @@ func (lc *fakeLocalServeClient) WatchIPNBus(ctx context.Context, mask ipn.Notify
 
 func (lc *fakeLocalServeClient) IncrementCounter(ctx context.Context, name string, delta int) error {
 	return nil // unused in tests
-}
-
-func (lc *fakeLocalServeClient) StreamServe(ctx context.Context, req ipn.ServeStreamRequest) (io.ReadCloser, error) {
-	// TODO: testing :)
-	return nil, nil
 }
 
 // exactError returns an error checker that wants exactly the provided want error.

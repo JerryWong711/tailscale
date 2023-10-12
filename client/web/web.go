@@ -7,19 +7,19 @@ package web
 import (
 	"context"
 	"crypto/rand"
-	"embed"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
-	"io/fs"
 	"log"
 	"net/http"
-	"net/http/httputil"
 	"net/netip"
 	"os"
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/gorilla/csrf"
 	"tailscale.com/client/tailscale"
@@ -31,46 +31,93 @@ import (
 	"tailscale.com/net/netutil"
 	"tailscale.com/tailcfg"
 	"tailscale.com/util/httpm"
-	"tailscale.com/util/must"
 	"tailscale.com/version/distro"
 )
-
-// This contains all files needed to build the frontend assets.
-// Because we assign this to the blank identifier, it does not actually embed the files.
-// However, this does cause `go mod vendor` to include the files when vendoring the package.
-// External packages that use the web client can `go mod vendor`, run `yarn build` to
-// build the assets, then those asset bundles will be embedded.
-//
-//go:embed yarn.lock index.html *.js *.json src/*
-var _ embed.FS
-
-//go:embed build/*
-var embeddedFS embed.FS
-
-// staticfiles serves static files from the build directory.
-var staticfiles http.Handler
 
 // Server is the backend server for a Tailscale web client.
 type Server struct {
 	lc *tailscale.LocalClient
 
-	devMode  bool
-	devProxy *httputil.ReverseProxy // only filled when devMode is on
+	devMode     bool
+	tsDebugMode string
 
 	cgiMode    bool
-	cgiPath    string
-	apiHandler http.Handler // csrf-protected api handler
+	pathPrefix string
+
+	assetsHandler http.Handler // serves frontend assets
+	apiHandler    http.Handler // serves api endpoints; csrf-protected
+
+	// browserSessions is an in-memory cache of browser sessions for the
+	// full management web client, which is only accessible over Tailscale.
+	//
+	// Users obtain a valid browser session by connecting to the web client
+	// over Tailscale and verifying their identity by authenticating on the
+	// control server.
+	//
+	// browserSessions get reset on every Server restart.
+	//
+	// The map provides a lookup of the session by cookie value
+	// (browserSession.ID => browserSession).
+	browserSessions sync.Map
+}
+
+const (
+	sessionCookieName   = "TS-Web-Session"
+	sessionCookieExpiry = time.Hour * 24 * 30 // 30 days
+)
+
+// browserSession holds data about a user's browser session
+// on the full management web client.
+type browserSession struct {
+	// ID is the unique identifier for the session.
+	// It is passed in the user's "TS-Web-Session" browser cookie.
+	ID            string
+	SrcNode       tailcfg.StableNodeID
+	SrcUser       tailcfg.UserID
+	AuthURL       string    // control server URL for user to authenticate the session
+	Authenticated time.Time // when zero, authentication not complete
+}
+
+// isAuthorized reports true if the given session is authorized
+// to be used by its associated user to access the full management
+// web client.
+//
+// isAuthorized is true only when s.Authenticated is non-zero
+// (i.e. the user has authenticated the session) and the session
+// is not expired.
+// 2023-10-05: Sessions expire by default after 30 days.
+func (s *browserSession) isAuthorized() bool {
+	switch {
+	case s == nil:
+		return false
+	case s.Authenticated.IsZero():
+		return false // awaiting auth
+	case s.isExpired(): // TODO: add time field to server?
+		return false // expired
+	}
+	return true
+}
+
+// isExpired reports true if s is expired.
+// 2023-10-05: Sessions expire by default after 30 days.
+// If s.Authenticated is zero, isExpired reports false.
+func (s *browserSession) isExpired() bool {
+	return !s.Authenticated.IsZero() && s.Authenticated.Before(time.Now().Add(-sessionCookieExpiry)) // TODO: add time field to server?
 }
 
 // ServerOpts contains options for constructing a new Server.
 type ServerOpts struct {
 	DevMode bool
 
+	// LoginOnly indicates that the server should only serve the minimal
+	// login client and not the full web client.
+	LoginOnly bool
+
 	// CGIMode indicates if the server is running as a CGI script.
 	CGIMode bool
 
-	// If running in CGIMode, CGIPath is the URL path prefix to the CGI script.
-	CGIPath string
+	// PathPrefix is the URL prefix added to requests by CGI or reverse proxy.
+	PathPrefix string
 
 	// LocalClient is the tailscale.LocalClient to use for this web server.
 	// If nil, a new one will be created.
@@ -78,22 +125,17 @@ type ServerOpts struct {
 }
 
 // NewServer constructs a new Tailscale web client server.
-// The provided context should live for the duration of the Server's lifetime.
-func NewServer(ctx context.Context, opts ServerOpts) (s *Server, cleanup func()) {
+func NewServer(opts ServerOpts) (s *Server, cleanup func()) {
 	if opts.LocalClient == nil {
 		opts.LocalClient = &tailscale.LocalClient{}
 	}
 	s = &Server{
-		devMode: opts.DevMode,
-		lc:      opts.LocalClient,
-		cgiMode: opts.CGIMode,
-		cgiPath: opts.CGIPath,
+		devMode:    opts.DevMode,
+		lc:         opts.LocalClient,
+		pathPrefix: opts.PathPrefix,
 	}
-	cleanup = func() {}
-	if s.devMode {
-		cleanup = s.startDevServer()
-		s.addProxyToDevServer()
-	}
+	s.tsDebugMode = s.debugMode()
+	s.assetsHandler, cleanup = assetsHandler(opts.DevMode)
 
 	// Create handler for "/api" requests with CSRF protection.
 	// We don't require secure cookies, since the web client is regularly used
@@ -101,90 +143,233 @@ func NewServer(ctx context.Context, opts ServerOpts) (s *Server, cleanup func())
 	// The client is secured by limiting the interface it listens on,
 	// or by authenticating requests before they reach the web client.
 	csrfProtect := csrf.Protect(s.csrfKey(), csrf.Secure(false))
-	s.apiHandler = csrfProtect(http.HandlerFunc(s.serveAPI))
+	if s.tsDebugMode == "login" {
+		// For the login client, we don't serve the full web client API,
+		// only the login endpoints.
+		s.apiHandler = csrfProtect(http.HandlerFunc(s.serveLoginAPI))
+		s.lc.IncrementCounter(context.Background(), "web_login_client_initialization", 1)
+	} else {
+		s.apiHandler = csrfProtect(http.HandlerFunc(s.serveAPI))
+		s.lc.IncrementCounter(context.Background(), "web_client_initialization", 1)
+	}
 
-	s.lc.IncrementCounter(context.Background(), "web_client_initialization", 1)
 	return s, cleanup
 }
 
-func init() {
-	buildFiles := must.Get(fs.Sub(embeddedFS, "build"))
-	staticfiles = http.FileServer(http.FS(buildFiles))
+// debugMode returns the debug mode the web client is being run in.
+// The empty string is returned in the case that this instance is
+// not running in any debug mode.
+func (s *Server) debugMode() string {
+	if !s.devMode {
+		return "" // debug modes only available in dev
+	}
+	switch mode := os.Getenv("TS_DEBUG_WEB_CLIENT_MODE"); mode {
+	case "login", "full": // valid debug modes
+		return mode
+	}
+	return ""
 }
 
 // ServeHTTP processes all requests for the Tailscale web client.
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	handler := s.serve
 
-	// if running in cgi mode, strip the cgi path prefix
-	if s.cgiMode {
-		prefix := s.cgiPath
-		if prefix == "" {
-			switch distro.Get() {
-			case distro.Synology:
-				prefix = synologyPrefix
-			case distro.QNAP:
-				prefix = qnapPrefix
-			}
-		}
-		if prefix != "" {
-			handler = enforcePrefix(prefix, handler)
-		}
+	// if path prefix is defined, strip it from requests.
+	if s.pathPrefix != "" {
+		handler = enforcePrefix(s.pathPrefix, handler)
 	}
 
 	handler(w, r)
 }
 
-// authorize checks if the request is authorized to access the web client for those platforms that support it.
-func authorize(w http.ResponseWriter, r *http.Request) (handled bool) {
-	if strings.HasPrefix(r.URL.Path, "/assets/") {
-		// don't require authorization for static assets
-		return false
+func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
+	if strings.HasPrefix(r.URL.Path, "/api/") {
+		// Pass API requests through to the API handler.
+		s.apiHandler.ServeHTTP(w, r)
+		return
 	}
+	if !s.devMode {
+		s.lc.IncrementCounter(context.Background(), "web_client_page_load", 1)
+	}
+	s.assetsHandler.ServeHTTP(w, r)
+}
 
+// authorizePlatformRequest reports whether the request from the web client
+// is authorized to access the client for those platforms that support it.
+// It reports true if the request is authorized, and false otherwise.
+// authorizePlatformRequest manages writing out any relevant authorization
+// errors to the ResponseWriter itself.
+func authorizePlatformRequest(w http.ResponseWriter, r *http.Request) (ok bool) {
 	switch distro.Get() {
 	case distro.Synology:
 		return authorizeSynology(w, r)
 	case distro.QNAP:
 		return authorizeQNAP(w, r)
 	}
-
-	return false
+	return true
 }
 
-func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
-	switch {
-	case authorize(w, r):
-		// Authenticate and authorize the request for platforms that support it.
-		// Return if the request was processed.
-		return
-	case strings.HasPrefix(r.URL.Path, "/api/"):
-		// Pass API requests through to the API handler.
-		s.apiHandler.ServeHTTP(w, r)
-		return
-	case s.devMode:
-		// When in dev mode, proxy non-api requests to the Vite dev server.
-		s.devProxy.ServeHTTP(w, r)
-		return
-	default:
-		// Otherwise, serve static files from the embedded filesystem.
-		s.lc.IncrementCounter(context.Background(), "web_client_page_load", 1)
-		staticfiles.ServeHTTP(w, r)
+// serveLoginAPI serves requests for the web login client.
+// It should only be called by Server.ServeHTTP, via Server.apiHandler,
+// which protects the handler using gorilla csrf.
+func (s *Server) serveLoginAPI(w http.ResponseWriter, r *http.Request) {
+	// The login client is run directly from client plugins,
+	// so first authenticate and authorize the request for the host platform.
+	if ok := authorizePlatformRequest(w, r); !ok {
 		return
 	}
+
+	w.Header().Set("X-CSRF-Token", csrf.Token(r))
+	if r.URL.Path != "/api/data" { // only endpoint allowed for login client
+		http.Error(w, "invalid endpoint", http.StatusNotFound)
+		return
+	}
+	switch r.Method {
+	case httpm.GET:
+		// TODO(soniaappasamy): we may want a minimal node data response here
+		s.serveGetNodeData(w, r)
+	case httpm.POST:
+		// TODO(soniaappasamy): implement
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+	return
+}
+
+var (
+	errNoSession         = errors.New("no-browser-session")
+	errNotUsingTailscale = errors.New("not-using-tailscale")
+	errTaggedSource      = errors.New("tagged-source")
+	errNotOwner          = errors.New("not-owner")
+)
+
+// getTailscaleBrowserSession retrieves the browser session associated with
+// the request, if one exists.
+//
+// An error is returned in any of the following cases:
+//
+//   - (errNotUsingTailscale) The request was not made over tailscale.
+//
+//   - (errNoSession) The request does not have a session.
+//
+//   - (errTaggedSource) The source is a tagged node. Users must use their
+//     own user-owned devices to manage other nodes' web clients.
+//
+//   - (errNotOwner) The source is not the owner of this client (if the
+//     client is user-owned). Only the owner is allowed to manage the
+//     node via the web client.
+//
+// If no error is returned, the browserSession is always non-nil.
+// getTailscaleBrowserSession does not check whether the session has been
+// authorized by the user. Callers can use browserSession.isAuthorized.
+func (s *Server) getTailscaleBrowserSession(r *http.Request) (*browserSession, error) {
+	whoIs, err := s.lc.WhoIs(r.Context(), r.RemoteAddr)
+	switch {
+	case err != nil:
+		return nil, errNotUsingTailscale
+	case whoIs.Node.IsTagged():
+		return nil, errTaggedSource
+	}
+	srcNode := whoIs.Node.StableID
+	srcUser := whoIs.UserProfile.ID
+
+	status, err := s.lc.StatusWithoutPeers(r.Context())
+	switch {
+	case err != nil:
+		return nil, err
+	case status.Self == nil:
+		return nil, errors.New("missing self node in tailscale status")
+	case !status.Self.IsTagged() && status.Self.UserID != srcUser:
+		return nil, errNotOwner
+	}
+
+	cookie, err := r.Cookie(sessionCookieName)
+	if errors.Is(err, http.ErrNoCookie) {
+		return nil, errNoSession
+	} else if err != nil {
+		return nil, err
+	}
+	v, ok := s.browserSessions.Load(cookie.Value)
+	if !ok {
+		return nil, errNoSession
+	}
+	session := v.(*browserSession)
+	if session.SrcNode != srcNode || session.SrcUser != srcUser {
+		// In this case the browser cookie is associated with another tailscale node.
+		// Maybe the source browser's machine was logged out and then back in as a different node.
+		// Return errNoSession because there is no session for this user.
+		return nil, errNoSession
+	} else if session.isExpired() {
+		// Session expired, remove from session map and return errNoSession.
+		s.browserSessions.Delete(session.ID)
+		return nil, errNoSession
+	}
+	return session, nil
+}
+
+type authResponse struct {
+	OK      bool   `json:"ok"`                // true when user has valid auth session
+	AuthURL string `json:"authUrl,omitempty"` // filled when user has control auth action to take
+	Error   string `json:"error,omitempty"`   // filled when Ok is false
+}
+
+func (s *Server) serveTailscaleAuth(w http.ResponseWriter, r *http.Request) {
+	var resp authResponse
+
+	session, err := s.getTailscaleBrowserSession(r)
+	switch {
+	case err != nil && !errors.Is(err, errNoSession):
+		resp = authResponse{OK: false, Error: err.Error()}
+	case session == nil:
+		// TODO(tailscale/corp#14335): Create a new auth path from control,
+		// and store back to s.browserSessions and request cookie.
+	case !session.isAuthorized():
+		// TODO(tailscale/corp#14335): Check on the session auth path status from control,
+		// and store back to s.browserSessions.
+	default:
+		resp = authResponse{OK: true}
+	}
+
+	if err := json.NewEncoder(w).Encode(resp); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
 }
 
 // serveAPI serves requests for the web client api.
 // It should only be called by Server.ServeHTTP, via Server.apiHandler,
 // which protects the handler using gorilla csrf.
 func (s *Server) serveAPI(w http.ResponseWriter, r *http.Request) {
+	if s.tsDebugMode == "full" {
+		// tailscale/corp#14335: Only restrict to tailscale auth in debug "full" web client mode.
+		// TODO(sonia,will): Switch serveAPI over to always require TS auth when we're ready
+		// to remove the debug flags.
+		// For now, existing client uses platform auth (else case below).
+
+		if r.URL.Path == "/api/auth" {
+			// Serve auth, which creates a new session for the user to authenticate,
+			// in the case that the request doesn't already have one.
+			s.serveTailscaleAuth(w, r)
+			return
+		}
+		// For all other endpoints, require a valid session to proceed.
+		session, err := s.getTailscaleBrowserSession(r)
+		if err != nil || !session.isAuthorized() {
+			http.Error(w, "no valid session", http.StatusUnauthorized)
+			return
+		}
+	} else if ok := authorizePlatformRequest(w, r); !ok {
+		return
+	}
+
 	w.Header().Set("X-CSRF-Token", csrf.Token(r))
 	path := strings.TrimPrefix(r.URL.Path, "/api")
 	switch {
 	case path == "/data":
 		switch r.Method {
 		case httpm.GET:
-			s.serveGetNodeDataJSON(w, r)
+			s.serveGetNodeData(w, r)
 		case httpm.POST:
 			s.servePostNodeUpdate(w, r)
 		default:
@@ -212,16 +397,19 @@ type nodeData struct {
 	IsUnraid          bool
 	UnraidToken       string
 	IPNVersion        string
+	DebugMode         string // empty when not running in any debug mode
 }
 
-func (s *Server) getNodeData(ctx context.Context) (*nodeData, error) {
-	st, err := s.lc.Status(ctx)
+func (s *Server) serveGetNodeData(w http.ResponseWriter, r *http.Request) {
+	st, err := s.lc.Status(r.Context())
 	if err != nil {
-		return nil, err
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
 	}
-	prefs, err := s.lc.GetPrefs(ctx)
+	prefs, err := s.lc.GetPrefs(r.Context())
 	if err != nil {
-		return nil, err
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
 	}
 	profile := st.User[st.Self.UserID]
 	deviceName := strings.Split(st.Self.DNSName, ".")[0]
@@ -237,6 +425,7 @@ func (s *Server) getNodeData(ctx context.Context) (*nodeData, error) {
 		IsUnraid:    distro.Get() == distro.Unraid,
 		UnraidToken: os.Getenv("UNRAID_CSRF_TOKEN"),
 		IPNVersion:  versionShort,
+		DebugMode:   s.tsDebugMode,
 	}
 	exitNodeRouteV4 := netip.MustParsePrefix("0.0.0.0/0")
 	exitNodeRouteV6 := netip.MustParsePrefix("::/0")
@@ -252,15 +441,6 @@ func (s *Server) getNodeData(ctx context.Context) (*nodeData, error) {
 	}
 	if len(st.TailscaleIPs) != 0 {
 		data.IP = st.TailscaleIPs[0].String()
-	}
-	return data, nil
-}
-
-func (s *Server) serveGetNodeDataJSON(w http.ResponseWriter, r *http.Request) {
-	data, err := s.getNodeData(r.Context())
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
 	}
 	if err := json.NewEncoder(w).Encode(*data); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -334,7 +514,6 @@ func (s *Server) servePostNodeUpdate(w http.ResponseWriter, r *http.Request) {
 	} else {
 		io.WriteString(w, "{}")
 	}
-	return
 }
 
 func (s *Server) tailscaleUp(ctx context.Context, st *ipnstate.Status, postData nodeUpdate) (authURL string, retErr error) {
@@ -456,16 +635,10 @@ var localapiAllowlist = []string{
 // If the server is running in CGI mode, the key is cached to disk and reused between requests.
 // If an error occurs during key storage, the error is logged and the active process terminated.
 func (s *Server) csrfKey() []byte {
-	var csrfFile string
+	csrfFile := filepath.Join(os.TempDir(), "tailscale-web-csrf.key")
 
 	// if running in CGI mode, try to read from disk, but ignore errors
 	if s.cgiMode {
-		confdir, err := os.UserConfigDir()
-		if err != nil {
-			confdir = os.TempDir()
-		}
-
-		csrfFile = filepath.Join(confdir, "tailscale", "web-csrf.key")
 		key, _ := os.ReadFile(csrfFile)
 		if len(key) == 32 {
 			return key
@@ -475,14 +648,11 @@ func (s *Server) csrfKey() []byte {
 	// create a new key
 	key := make([]byte, 32)
 	if _, err := rand.Read(key); err != nil {
-		log.Fatal("error generating CSRF key: %w", err)
+		log.Fatalf("error generating CSRF key: %v", err)
 	}
 
 	// if running in CGI mode, try to write the newly created key to disk, and exit if it fails.
 	if s.cgiMode {
-		if err := os.Mkdir(filepath.Dir(csrfFile), 0700); err != nil && !os.IsExist(err) {
-			log.Fatalf("unable to store CSRF key: %v", err)
-		}
 		if err := os.WriteFile(csrfFile, key, 0600); err != nil {
 			log.Fatalf("unable to store CSRF key: %v", err)
 		}
@@ -496,6 +666,19 @@ func (s *Server) csrfKey() []byte {
 // Unlike http.StripPrefix, it does not return a 404 if the prefix is not present.
 // Instead, it returns a redirect to the prefix path.
 func enforcePrefix(prefix string, h http.HandlerFunc) http.HandlerFunc {
+	if prefix == "" {
+		return h
+	}
+
+	// ensure that prefix always has both a leading and trailing slash so
+	// that relative links for JS and CSS assets work correctly.
+	if !strings.HasPrefix(prefix, "/") {
+		prefix = "/" + prefix
+	}
+	if !strings.HasSuffix(prefix, "/") {
+		prefix += "/"
+	}
+
 	return func(w http.ResponseWriter, r *http.Request) {
 		if !strings.HasPrefix(r.URL.Path, prefix) {
 			http.Redirect(w, r, prefix, http.StatusFound)

@@ -9,14 +9,18 @@ import (
 	"context"
 	"fmt"
 	"net/netip"
+	"slices"
 	"strings"
+	"sync"
 
 	"go.uber.org/zap"
-	"golang.org/x/exp/slices"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+	"tailscale.com/util/clientmetric"
+	"tailscale.com/util/set"
 )
 
 type ServiceReconciler struct {
@@ -24,7 +28,25 @@ type ServiceReconciler struct {
 	ssr                   *tailscaleSTSReconciler
 	logger                *zap.SugaredLogger
 	isDefaultLoadBalancer bool
+
+	mu sync.Mutex // protects following
+
+	// managedIngressProxies is a set of all ingress proxies that we're
+	// currently managing. This is only used for metrics.
+	managedIngressProxies set.Slice[types.UID]
+	// managedEgressProxies is a set of all egress proxies that we're currently
+	// managing. This is only used for metrics.
+	managedEgressProxies set.Slice[types.UID]
 }
+
+var (
+	// gaugeEgressProxies tracks the number of egress proxies that we're
+	// currently managing.
+	gaugeEgressProxies = clientmetric.NewGauge("k8s_egress_proxies")
+	// gaugeIngressProxies tracks the number of ingress proxies that we're
+	// currently managing.
+	gaugeIngressProxies = clientmetric.NewGauge("k8s_ingress_proxies")
+)
 
 func childResourceLabels(name, ns, typ string) map[string]string {
 	// You might wonder why we're using owner references, since they seem to be
@@ -55,8 +77,9 @@ func (a *ServiceReconciler) Reconcile(ctx context.Context, req reconcile.Request
 	} else if err != nil {
 		return reconcile.Result{}, fmt.Errorf("failed to get svc: %w", err)
 	}
-	if !svc.DeletionTimestamp.IsZero() || !a.shouldExpose(svc) {
-		logger.Debugf("service is being deleted or should not be exposed, cleaning up")
+	targetIP := a.tailnetTargetAnnotation(svc)
+	if !svc.DeletionTimestamp.IsZero() || !a.shouldExpose(svc) && targetIP == "" {
+		logger.Debugf("service is being deleted or is (no longer) referring to Tailscale ingress/egress, ensuring any created resources are cleaned up")
 		return reconcile.Result{}, a.maybeCleanup(ctx, logger, svc)
 	}
 
@@ -71,6 +94,12 @@ func (a *ServiceReconciler) maybeCleanup(ctx context.Context, logger *zap.Sugare
 	ix := slices.Index(svc.Finalizers, FinalizerName)
 	if ix < 0 {
 		logger.Debugf("no finalizer, nothing to do")
+		a.mu.Lock()
+		defer a.mu.Unlock()
+		a.managedIngressProxies.Remove(svc.UID)
+		a.managedEgressProxies.Remove(svc.UID)
+		gaugeIngressProxies.Set(int64(a.managedIngressProxies.Len()))
+		gaugeEgressProxies.Set(int64(a.managedEgressProxies.Len()))
 		return nil
 	}
 
@@ -91,6 +120,13 @@ func (a *ServiceReconciler) maybeCleanup(ctx context.Context, logger *zap.Sugare
 	// cleanup removes the tailscale finalizer, which will make all future
 	// reconciles exit early.
 	logger.Infof("unexposed service from tailnet")
+
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.managedIngressProxies.Remove(svc.UID)
+	a.managedEgressProxies.Remove(svc.UID)
+	gaugeIngressProxies.Set(int64(a.managedIngressProxies.Len()))
+	gaugeEgressProxies.Set(int64(a.managedEgressProxies.Len()))
 	return nil
 }
 
@@ -122,22 +158,45 @@ func (a *ServiceReconciler) maybeProvision(ctx context.Context, logger *zap.Suga
 		tags = strings.Split(tstr, ",")
 	}
 
-	clusterIPAddr, err := netip.ParseAddr(svc.Spec.ClusterIP)
-	if err != nil {
-		return fmt.Errorf("failed to parse cluster IP: %w", err)
-	}
-
 	sts := &tailscaleSTSConfig{
 		ParentResourceName:  svc.Name,
 		ParentResourceUID:   string(svc.UID),
-		TargetIP:            svc.Spec.ClusterIP,
 		Hostname:            hostname,
 		Tags:                tags,
 		ChildResourceLabels: crl,
 	}
 
-	if err := a.ssr.Provision(ctx, logger, sts); err != nil {
+	a.mu.Lock()
+	if a.shouldExpose(svc) {
+		sts.ClusterTargetIP = svc.Spec.ClusterIP
+		a.managedIngressProxies.Add(svc.UID)
+		gaugeIngressProxies.Set(int64(a.managedIngressProxies.Len()))
+	} else if ip := a.tailnetTargetAnnotation(svc); ip != "" {
+		sts.TailnetTargetIP = ip
+		a.managedEgressProxies.Add(svc.UID)
+		gaugeEgressProxies.Set(int64(a.managedEgressProxies.Len()))
+	}
+	a.mu.Unlock()
+
+	var hsvc *corev1.Service
+	if hsvc, err = a.ssr.Provision(ctx, logger, sts); err != nil {
 		return fmt.Errorf("failed to provision: %w", err)
+	}
+
+	if sts.TailnetTargetIP != "" {
+		// TODO (irbekrm): cluster.local is the default DNS name, but
+		// can be changed by users. Make this configurable or figure out
+		// how to discover the DNS name from within operator
+		headlessSvcName := hsvc.Name + "." + hsvc.Namespace + ".svc.cluster.local"
+		if svc.Spec.ExternalName != headlessSvcName || svc.Spec.Type != corev1.ServiceTypeExternalName {
+			svc.Spec.ExternalName = headlessSvcName
+			svc.Spec.Selector = nil
+			svc.Spec.Type = corev1.ServiceTypeExternalName
+			if err := a.Update(ctx, svc); err != nil {
+				return fmt.Errorf("failed to update service: %w", err)
+			}
+		}
+		return nil
 	}
 
 	if !a.hasLoadBalancerClass(svc) {
@@ -163,6 +222,10 @@ func (a *ServiceReconciler) maybeProvision(ctx context.Context, logger *zap.Suga
 	ingress := []corev1.LoadBalancerIngress{
 		{Hostname: tsHost},
 	}
+	clusterIPAddr, err := netip.ParseAddr(svc.Spec.ClusterIP)
+	if err != nil {
+		return fmt.Errorf("failed to parse cluster IP: %w", err)
+	}
 	for _, ip := range tsIPs {
 		addr, err := netip.ParseAddr(ip)
 		if err != nil {
@@ -186,7 +249,7 @@ func (a *ServiceReconciler) shouldExpose(svc *corev1.Service) bool {
 		return false
 	}
 
-	return a.hasLoadBalancerClass(svc) || a.hasAnnotation(svc)
+	return a.hasLoadBalancerClass(svc) || a.hasExposeAnnotation(svc)
 }
 
 func (a *ServiceReconciler) hasLoadBalancerClass(svc *corev1.Service) bool {
@@ -196,7 +259,22 @@ func (a *ServiceReconciler) hasLoadBalancerClass(svc *corev1.Service) bool {
 			svc.Spec.LoadBalancerClass == nil && a.isDefaultLoadBalancer)
 }
 
-func (a *ServiceReconciler) hasAnnotation(svc *corev1.Service) bool {
-	return svc != nil &&
-		svc.Annotations[AnnotationExpose] == "true"
+// hasExposeAnnotation reports whether Service has the tailscale.com/expose
+// annotation set
+func (a *ServiceReconciler) hasExposeAnnotation(svc *corev1.Service) bool {
+	return svc != nil && svc.Annotations[AnnotationExpose] == "true"
+}
+
+// hasTailnetTargetAnnotation returns the value of tailscale.com/tailnet-ip
+// annotation or of the deprecated tailscale.com/ts-tailnet-target-ip
+// annotation. If neither is set, it returns an empty string. If both are set,
+// it returns the value of the new annotation.
+func (a *ServiceReconciler) tailnetTargetAnnotation(svc *corev1.Service) string {
+	if svc == nil {
+		return ""
+	}
+	if ip := svc.Annotations[AnnotationTailnetTargetIP]; ip != "" {
+		return ip
+	}
+	return svc.Annotations[annotationTailnetTargetIPOld]
 }

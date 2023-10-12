@@ -5,7 +5,9 @@ package ipnlocal
 
 import (
 	"context"
+	"crypto/sha256"
 	"crypto/tls"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -23,7 +25,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/google/uuid"
 	"tailscale.com/ipn"
 	"tailscale.com/logtail/backoff"
 	"tailscale.com/net/netutil"
@@ -33,6 +34,11 @@ import (
 	"tailscale.com/util/mak"
 	"tailscale.com/version"
 )
+
+// ErrETagMismatch signals that the given
+// If-Match header does not match with the
+// current etag of a resource.
+var ErrETagMismatch = errors.New("etag mismatch")
 
 // serveHTTPContextKey is the context.Value key for a *serveHTTPContext.
 type serveHTTPContextKey struct{}
@@ -154,8 +160,9 @@ func (s *serveListener) shouldWarnAboutListenError(err error) bool {
 	return true
 }
 
-// handleServeListenersAccept accepts connections for the Listener.
-// Calls incoming handler in a new goroutine for each accepted connection.
+// handleServeListenersAccept accepts connections for the Listener. It calls the
+// handler in a new goroutine for each accepted connection. This is used to
+// handle local "tailscale serve" traffic originating from the machine itself.
 func (s *serveListener) handleServeListenersAccept(ln net.Listener) error {
 	for {
 		conn, err := ln.Accept()
@@ -165,7 +172,7 @@ func (s *serveListener) handleServeListenersAccept(ln net.Listener) error {
 		srcAddr := conn.RemoteAddr().(*net.TCPAddr).AddrPort()
 		handler := s.b.tcpHandlerForServe(s.ap.Port(), srcAddr)
 		if handler == nil {
-			s.b.logf("serve RST for %v", srcAddr)
+			s.b.logf("[unexpected] local-serve: no handler for %v to port %v", srcAddr, s.ap.Port())
 			conn.Close()
 			continue
 		}
@@ -199,7 +206,9 @@ func (b *LocalBackend) updateServeTCPPortNetMapAddrListenersLocked(ports []uint1
 		return
 	}
 
-	for _, a := range nm.Addresses {
+	addrs := nm.GetAddresses()
+	for i := range addrs.LenIter() {
+		a := addrs.At(i)
 		for _, p := range ports {
 			addrPort := netip.AddrPortFrom(a.Addr(), p)
 			if _, ok := b.serveListeners[addrPort]; ok {
@@ -215,10 +224,15 @@ func (b *LocalBackend) updateServeTCPPortNetMapAddrListenersLocked(ports []uint1
 }
 
 // SetServeConfig establishes or replaces the current serve config.
-func (b *LocalBackend) SetServeConfig(config *ipn.ServeConfig) error {
+// ETag is an optional parameter to enforce Optimistic Concurrency Control.
+// If it is an empty string, then the config will be overwritten.
+func (b *LocalBackend) SetServeConfig(config *ipn.ServeConfig, etag string) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	return b.setServeConfigLocked(config, etag)
+}
 
+func (b *LocalBackend) setServeConfigLocked(config *ipn.ServeConfig, etag string) error {
 	prefs := b.pm.CurrentPrefs()
 	if config.IsFunnelOn() && prefs.ShieldsUp() {
 		return errors.New("Unable to turn on Funnel while shields-up is enabled")
@@ -231,8 +245,25 @@ func (b *LocalBackend) SetServeConfig(config *ipn.ServeConfig) error {
 	if !nm.SelfNode.Valid() {
 		return errors.New("netMap SelfNode is nil")
 	}
-	profileID := b.pm.CurrentProfile().ID
-	confKey := ipn.ServeConfigKey(profileID)
+
+	// If etag is present, check that it has
+	// not changed from the last config.
+	prevConfig := b.serveConfig
+	if etag != "" {
+		// Note that we marshal b.serveConfig
+		// and not use b.lastServeConfJSON as that might
+		// be a Go nil value, which produces a different
+		// checksum from a JSON "null" value.
+		prevBytes, err := json.Marshal(prevConfig)
+		if err != nil {
+			return fmt.Errorf("error encoding previous config: %w", err)
+		}
+		sum := sha256.Sum256(prevBytes)
+		previousEtag := hex.EncodeToString(sum[:])
+		if etag != previousEtag {
+			return ErrETagMismatch
+		}
+	}
 
 	var bs []byte
 	if config != nil {
@@ -242,11 +273,34 @@ func (b *LocalBackend) SetServeConfig(config *ipn.ServeConfig) error {
 		}
 		bs = j
 	}
+
+	profileID := b.pm.CurrentProfile().ID
+	confKey := ipn.ServeConfigKey(profileID)
 	if err := b.store.WriteState(confKey, bs); err != nil {
 		return fmt.Errorf("writing ServeConfig to StateStore: %w", err)
 	}
 
 	b.setTCPPortsInterceptedFromNetmapAndPrefsLocked(b.pm.CurrentPrefs())
+
+	// clean up and close all previously open foreground sessions
+	// if the current ServeConfig has overwritten them.
+	if prevConfig.Valid() {
+		has := func(string) bool { return false }
+		if b.serveConfig.Valid() {
+			has = b.serveConfig.Foreground().Has
+		}
+		prevConfig.Foreground().Range(func(k string, v ipn.ServeConfigView) (cont bool) {
+			if !has(k) {
+				for _, sess := range b.notifyWatchers {
+					if sess.sessionID == k {
+						close(sess.ch)
+					}
+				}
+			}
+			return true
+		})
+	}
+
 	return nil
 }
 
@@ -258,190 +312,57 @@ func (b *LocalBackend) ServeConfig() ipn.ServeConfigView {
 	return b.serveConfig
 }
 
-// StreamServe opens a stream to write any incoming connections made
-// to the given HostPort out to the listening io.Writer.
-//
-// If Serve and Funnel were not already enabled for the HostPort in the ServeConfig,
-// the backend enables it for the duration of the context's lifespan and
-// then turns it back off once the context is closed. If either are already enabled,
-// then they remain that way but logs are still streamed
-func (b *LocalBackend) StreamServe(ctx context.Context, w io.Writer, req ipn.ServeStreamRequest) (err error) {
-	f, ok := w.(http.Flusher)
-	if !ok {
-		return errors.New("writer not a flusher")
-	}
-	f.Flush()
-
-	port, err := req.HostPort.Port()
-	if err != nil {
-		return err
-	}
-
-	// Turn on Funnel for the given HostPort.
-	sc := b.ServeConfig().AsStruct()
-	if sc == nil {
-		sc = &ipn.ServeConfig{}
-	}
-	setHandler(sc, req)
-	if err := b.SetServeConfig(sc); err != nil {
-		return fmt.Errorf("errro setting serve config: %w", err)
-	}
-	// Defer turning off Funnel once stream ends.
-	defer func() {
-		sc := b.ServeConfig().AsStruct()
-		deleteHandler(sc, req, port)
-		err = errors.Join(err, b.SetServeConfig(sc))
-	}()
-
-	var writeErrs []error
-	writeToStream := func(log ipn.FunnelRequestLog) {
-		jsonLog, err := json.Marshal(log)
-		if err != nil {
-			writeErrs = append(writeErrs, err)
-			return
-		}
-		if _, err := fmt.Fprintf(w, "%s\n", jsonLog); err != nil {
-			writeErrs = append(writeErrs, err)
-			return
-		}
-		f.Flush()
-	}
-
-	// Hook up connections stream.
+// DeleteForegroundSession deletes a ServeConfig's foreground session
+// in the LocalBackend if it exists. It also ensures check, delete, and
+// set operations happen within the same mutex lock to avoid any races.
+func (b *LocalBackend) DeleteForegroundSession(sessionID string) error {
 	b.mu.Lock()
-	mak.NonNilMapForJSON(&b.serveStreamers)
-	if b.serveStreamers[port] == nil {
-		b.serveStreamers[port] = make(map[uint32]func(ipn.FunnelRequestLog))
+	defer b.mu.Unlock()
+	if !b.serveConfig.Valid() || !b.serveConfig.Foreground().Has(sessionID) {
+		return nil
 	}
-	id := uuid.New().ID()
-	b.serveStreamers[port][id] = writeToStream
-	b.mu.Unlock()
-
-	// Clean up streamer when done.
-	defer func() {
-		b.mu.Lock()
-		delete(b.serveStreamers[port], id)
-		b.mu.Unlock()
-	}()
-
-	select {
-	case <-ctx.Done():
-		// Triggered by foreground `tailscale funnel` process
-		// (the streamer) getting closed, or by turning off Tailscale.
-	}
-
-	return errors.Join(writeErrs...)
+	sc := b.serveConfig.AsStruct()
+	delete(sc.Foreground, sessionID)
+	return b.setServeConfigLocked(sc, "")
 }
 
-func setHandler(sc *ipn.ServeConfig, req ipn.ServeStreamRequest) {
-	if sc.TCP == nil {
-		sc.TCP = make(map[uint16]*ipn.TCPPortHandler)
-	}
-	if _, ok := sc.TCP[443]; !ok {
-		sc.TCP[443] = &ipn.TCPPortHandler{
-			HTTPS: true,
-		}
-	}
-	if sc.Web == nil {
-		sc.Web = make(map[ipn.HostPort]*ipn.WebServerConfig)
-	}
-	wsc, ok := sc.Web[req.HostPort]
-	if !ok {
-		wsc = &ipn.WebServerConfig{}
-		sc.Web[req.HostPort] = wsc
-	}
-	if wsc.Handlers == nil {
-		wsc.Handlers = make(map[string]*ipn.HTTPHandler)
-	}
-	wsc.Handlers[req.MountPoint] = &ipn.HTTPHandler{
-		Proxy: req.Source,
-	}
-	if sc.AllowFunnel == nil {
-		sc.AllowFunnel = make(map[ipn.HostPort]bool)
-	}
-	sc.AllowFunnel[req.HostPort] = true
-}
-
-func deleteHandler(sc *ipn.ServeConfig, req ipn.ServeStreamRequest, port uint16) {
-	delete(sc.AllowFunnel, req.HostPort)
-	if sc.TCP != nil {
-		delete(sc.TCP, port)
-	}
-	if sc.Web == nil {
-		return
-	}
-	if sc.Web[req.HostPort] == nil {
-		return
-	}
-	wsc, ok := sc.Web[req.HostPort]
-	if !ok {
-		return
-	}
-	if wsc.Handlers == nil {
-		return
-	}
-	if _, ok := wsc.Handlers[req.MountPoint]; !ok {
-		return
-	}
-	delete(wsc.Handlers, req.MountPoint)
-	if len(wsc.Handlers) == 0 {
-		delete(sc.Web, req.HostPort)
-	}
-}
-
-func (b *LocalBackend) maybeLogServeConnection(destPort uint16, srcAddr netip.AddrPort) {
-	b.mu.Lock()
-	streamers := b.serveStreamers[destPort]
-	b.mu.Unlock()
-	if len(streamers) == 0 {
-		return
-	}
-
-	var log ipn.FunnelRequestLog
-	log.SrcAddr = srcAddr
-	log.Time = b.clock.Now()
-
-	if node, user, ok := b.WhoIs(srcAddr); ok {
-		log.NodeName = node.ComputedName()
-		if node.IsTagged() {
-			log.NodeTags = node.Tags().AsSlice()
-		} else {
-			log.UserLoginName = user.LoginName
-			log.UserDisplayName = user.DisplayName
-		}
-	}
-
-	for _, stream := range streamers {
-		stream(log)
-	}
-}
-
+// HandleIngressTCPConn handles a TCP connection initiated by the ingressPeer
+// proxied to the local node over the PeerAPI.
+// Target represents the destination HostPort of the conn.
+// srcAddr represents the source AddrPort and not that of the ingressPeer.
+// getConnOrReset is a callback to get the connection, or reset if the connection
+// is no longer available.
+// sendRST is a callback to send a TCP RST to the ingressPeer indicating that
+// the connection was not accepted.
 func (b *LocalBackend) HandleIngressTCPConn(ingressPeer tailcfg.NodeView, target ipn.HostPort, srcAddr netip.AddrPort, getConnOrReset func() (net.Conn, bool), sendRST func()) {
 	b.mu.Lock()
 	sc := b.serveConfig
 	b.mu.Unlock()
 
+	// TODO(maisem,bradfitz): make this not alloc for every conn.
+	logf := logger.WithPrefix(b.logf, "handleIngress: ")
+
 	if !sc.Valid() {
-		b.logf("localbackend: got ingress conn w/o serveConfig; rejecting")
+		logf("got ingress conn w/o serveConfig; rejecting")
 		sendRST()
 		return
 	}
 
-	if !sc.AllowFunnel().Get(target) {
-		b.logf("localbackend: got ingress conn for unconfigured %q; rejecting", target)
+	if !sc.HasFunnelForTarget(target) {
+		logf("got ingress conn for unconfigured %q; rejecting", target)
 		sendRST()
 		return
 	}
 
 	_, port, err := net.SplitHostPort(string(target))
 	if err != nil {
-		b.logf("localbackend: got ingress conn for bad target %q; rejecting", target)
+		logf("got ingress conn for bad target %q; rejecting", target)
 		sendRST()
 		return
 	}
 	port16, err := strconv.ParseUint(port, 10, 16)
 	if err != nil {
-		b.logf("localbackend: got ingress conn for bad target %q; rejecting", target)
+		logf("got ingress conn for bad target %q; rejecting", target)
 		sendRST()
 		return
 	}
@@ -451,7 +372,7 @@ func (b *LocalBackend) HandleIngressTCPConn(ingressPeer tailcfg.NodeView, target
 		if handler != nil {
 			c, ok := getConnOrReset()
 			if !ok {
-				b.logf("localbackend: getConn didn't complete from %v to port %v", srcAddr, dport)
+				logf("getConn didn't complete from %v to port %v", srcAddr, dport)
 				return
 			}
 			handler(c)
@@ -462,12 +383,13 @@ func (b *LocalBackend) HandleIngressTCPConn(ingressPeer tailcfg.NodeView, target
 	// extend serveHTTPContext or similar.
 	handler := b.tcpHandlerForServe(dport, srcAddr)
 	if handler == nil {
+		logf("[unexpected] no matching ingress serve handler for %v to port %v", srcAddr, dport)
 		sendRST()
 		return
 	}
 	c, ok := getConnOrReset()
 	if !ok {
-		b.logf("localbackend: getConn didn't complete from %v to port %v", srcAddr, dport)
+		logf("getConn didn't complete from %v to port %v", srcAddr, dport)
 		return
 	}
 	handler(c)
@@ -481,13 +403,11 @@ func (b *LocalBackend) tcpHandlerForServe(dport uint16, srcAddr netip.AddrPort) 
 	b.mu.Unlock()
 
 	if !sc.Valid() {
-		b.logf("[unexpected] localbackend: got TCP conn w/o serveConfig; from %v to port %v", srcAddr, dport)
 		return nil
 	}
 
-	tcph, ok := sc.TCP().GetOk(dport)
+	tcph, ok := sc.FindTCP(dport)
 	if !ok {
-		b.logf("[unexpected] localbackend: got TCP conn without TCP config for port %v; from %v", dport, srcAddr)
 		return nil
 	}
 
@@ -518,7 +438,6 @@ func (b *LocalBackend) tcpHandlerForServe(dport uint16, srcAddr netip.AddrPort) 
 	if backDst := tcph.TCPForward(); backDst != "" {
 		return func(conn net.Conn) error {
 			defer conn.Close()
-			b.maybeLogServeConnection(dport, srcAddr)
 			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 			backConn, err := b.dialer.SystemDial(ctx, "tcp", backDst)
 			cancel()
@@ -560,7 +479,6 @@ func (b *LocalBackend) tcpHandlerForServe(dport uint16, srcAddr netip.AddrPort) 
 		}
 	}
 
-	b.logf("closing TCP conn to port %v (from %v) with actionless TCPPortHandler", dport, srcAddr)
 	return nil
 }
 
@@ -681,14 +599,13 @@ func (b *LocalBackend) addTailscaleIdentityHeaders(r *httputil.ProxyRequest) {
 	r.Out.Header.Set("Tailscale-Headers-Info", "https://tailscale.com/s/serve-headers")
 }
 
+// serveWebHandler is an http.HandlerFunc that maps incoming requests to the
+// correct *http.
 func (b *LocalBackend) serveWebHandler(w http.ResponseWriter, r *http.Request) {
 	h, mountPoint, ok := b.getServeHandler(r)
 	if !ok {
 		http.NotFound(w, r)
 		return
-	}
-	if c, ok := getServeHTTPContext(r); ok {
-		b.maybeLogServeConnection(c.DestPort, c.SrcAddr)
 	}
 	if s := h.Text(); s != "" {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
@@ -825,7 +742,7 @@ func (b *LocalBackend) webServerConfig(hostname string, port uint16) (c ipn.WebS
 	if !b.serveConfig.Valid() {
 		return c, false
 	}
-	return b.serveConfig.Web().GetOk(key)
+	return b.serveConfig.FindWeb(key)
 }
 
 func (b *LocalBackend) getTLSServeCertForPort(port uint16) func(hi *tls.ClientHelloInfo) (*tls.Certificate, error) {

@@ -194,7 +194,6 @@ func main() {
 		io.WriteString(w, "User-agent: *\nDisallow: /\n")
 	}))
 	mux.Handle("/generate_204", http.HandlerFunc(serveNoContent))
-	}))
 
 	if *runSTUN {
 		go serveSTUN(listenHost, *stunPort)

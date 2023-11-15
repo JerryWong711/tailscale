@@ -119,7 +119,8 @@ type CapabilityVersion int
 //   - 76: 2023-09-20: Client understands ExitNodeDNSResolvers for IsWireGuardOnly nodes
 //   - 77: 2023-10-03: Client understands Peers[].SelfNodeV6MasqAddrForThisPeer
 //   - 78: 2023-10-05: can handle c2n Wake-on-LAN sending
-const CurrentCapabilityVersion CapabilityVersion = 78
+//   - 79: 2023-10-05: Client understands UrgentSecurityUpdate in ClientVersion
+const CurrentCapabilityVersion CapabilityVersion = 79
 
 type StableID string
 
@@ -644,7 +645,7 @@ type Service struct {
 	//     * "peerapi6": peerapi is available on IPv6; Port is the
 	//        port number that the peerapi is running on the
 	//        node's Tailscale IPv6 address.
-	//     * "peerapi-dns": the local peerapi service supports
+	//     * "peerapi-dns-proxy": the local peerapi service supports
 	//        being a DNS proxy (when the node is an exit
 	//        node). For this service, the Port number is really
 	//        the version number of the service.
@@ -743,6 +744,7 @@ type Hostinfo struct {
 	Cloud           string         `json:",omitempty"`
 	Userspace       opt.Bool       `json:",omitempty"` // if the client is running in userspace (netstack) mode
 	UserspaceRouter opt.Bool       `json:",omitempty"` // if the client's subnet router is running in userspace (netstack) mode
+	AppConnector    opt.Bool       `json:",omitempty"` // if the client is running the app-connector service
 
 	// Location represents geographical location data about a
 	// Tailscale host. Location is optional and only set if
@@ -1100,6 +1102,17 @@ type RegisterRequest struct {
 	Timestamp     *time.Time    `json:",omitempty"` // creation time of request to prevent replay
 	DeviceCert    []byte        `json:",omitempty"` // X.509 certificate for client device
 	Signature     []byte        `json:",omitempty"` // as described by SignatureType
+
+	// Tailnet is an optional identifier specifying the name of the recommended or required
+	// network that the node should join. Its exact form should not be depended on; new
+	// forms are coming later. The identifier is generally a domain name (for an organization)
+	// or e-mail address (for a personal account on a shared e-mail provider). It is the same name
+	// used by the API, as described in /api.md#tailnet.
+	// If Tailnet begins with the prefix "required:" then the server should prevent logging in to a different
+	// network than the one specified. Otherwise, the server should recommend the specified network
+	// but still permit logging in to other networks.
+	// If empty, no recommendation is offered to the server and the login page should show all options.
+	Tailnet string `json:",omitempty"`
 }
 
 // RegisterResponse is returned by the server in response to a RegisterRequest.
@@ -1848,9 +1861,12 @@ type ClientVersion struct {
 	// LatestVersion is the latest version.Short ("1.34.2") version available
 	// for download for the client's platform and packaging type.
 	// It won't be populated if RunningLatest is true.
-	// The primary purpose of the LatestVersion value is to invalidate the client's
-	// cache update check value, if any. This primarily applies to Windows.
 	LatestVersion string `json:",omitempty"`
+
+	// UrgentSecurityUpdate is set when the client is missing an important
+	// security update. That update may be in LatestVersion or earlier.
+	// UrgentSecurityUpdate should not be set if RunningLatest is false.
+	UrgentSecurityUpdate bool `json:",omitempty"`
 
 	// Notify is whether the client should do an OS-specific notification about
 	// a new version being available. This should not be populated if
@@ -2025,6 +2041,7 @@ const (
 	CapabilityDataPlaneAuditLogs NodeCapability = "https://tailscale.com/cap/data-plane-audit-logs" // feature enabled
 	CapabilityDebug              NodeCapability = "https://tailscale.com/cap/debug"                 // exposes debug endpoints over the PeerAPI
 	CapabilityHTTPS              NodeCapability = "https"                                           // https cert provisioning enabled on tailnet
+	CapabilityPreviewWebClient   NodeCapability = "preview-webclient"                               // allows starting web client in tailscaled
 
 	// CapabilityBindToInterfaceByRoute changes how Darwin nodes create
 	// sockets (in the net/netns package). See that package for more
@@ -2105,6 +2122,10 @@ const (
 	// :0 to get a random local port, ignoring any configured
 	// fixed port.
 	NodeAttrRandomizeClientPort NodeCapability = "randomize-client-port"
+
+	// NodeAttrSilentDisco makes the client suppress disco heartbeats to its
+	// peers.
+	NodeAttrSilentDisco NodeCapability = "silent-disco"
 
 	// NodeAttrOneCGNATEnable makes the client prefer one big CGNAT /10 route
 	// rather than a /32 per peer. At most one of this or
@@ -2440,16 +2461,18 @@ type QueryFeatureResponse struct {
 // sent to "/machine/webclient/action" or "/machine/webclient/wait".
 // See client/web for usage.
 type WebClientAuthResponse struct {
-	// Message, if non-empty, provides a message for the user.
-	Message string `json:",omitempty"`
-
-	// Complete is true when the session authentication has been completed.
-	Complete bool `json:",omitempty"`
+	// ID is a unique identifier for the session auth request.
+	// It can be supplied to "/machine/webclient/wait" to pause until
+	// the session authentication has been completed.
+	ID string `json:",omitempty"`
 
 	// URL is the link for the user to visit to authenticate the session.
 	//
 	// When empty, there is no action for the user to take.
 	URL string `json:",omitempty"`
+
+	// Complete is true when the session authentication has been completed.
+	Complete bool `json:",omitempty"`
 }
 
 // OverTLSPublicKeyResponse is the JSON response to /key?v=<n>

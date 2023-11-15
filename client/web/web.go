@@ -29,23 +29,35 @@ import (
 	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/licenses"
 	"tailscale.com/net/netutil"
+	"tailscale.com/net/tsaddr"
 	"tailscale.com/tailcfg"
+	"tailscale.com/types/logger"
 	"tailscale.com/util/httpm"
 	"tailscale.com/version/distro"
 )
 
+// ListenPort is the static port used for the web client when run inside tailscaled.
+// (5252 are the numbers above the letters "TSTS" on a qwerty keyboard.)
+const ListenPort = 5252
+
 // Server is the backend server for a Tailscale web client.
 type Server struct {
-	lc *tailscale.LocalClient
+	mode ServerMode
 
-	devMode     bool
-	tsDebugMode string
+	logf    logger.Logf
+	lc      *tailscale.LocalClient
+	timeNow func() time.Time
 
+	// devMode indicates that the server run with frontend assets
+	// served by a Vite dev server, allowing for local development
+	// on the web client frontend.
+	devMode    bool
 	cgiMode    bool
 	pathPrefix string
 
-	assetsHandler http.Handler // serves frontend assets
 	apiHandler    http.Handler // serves api endpoints; csrf-protected
+	assetsHandler http.Handler // serves frontend assets
+	assetsCleanup func()       // called from Server.Shutdown
 
 	// browserSessions is an in-memory cache of browser sessions for the
 	// full management web client, which is only accessible over Tailscale.
@@ -61,57 +73,40 @@ type Server struct {
 	browserSessions sync.Map
 }
 
+// ServerMode specifies the mode of a running web.Server.
+type ServerMode string
+
 const (
-	sessionCookieName   = "TS-Web-Session"
-	sessionCookieExpiry = time.Hour * 24 * 30 // 30 days
+	// LoginServerMode serves a readonly login client for logging a
+	// node into a tailnet, and viewing a readonly interface of the
+	// node's current Tailscale settings.
+	//
+	// In this mode, API calls are authenticated via platform auth.
+	LoginServerMode ServerMode = "login"
+
+	// ManageServerMode serves a management client for editing tailscale
+	// settings of a node.
+	//
+	// This mode restricts the app to only being assessible over Tailscale,
+	// and API calls are authenticated via browser sessions associated with
+	// the source's Tailscale identity. If the source browser does not have
+	// a valid session, a readonly version of the app is displayed.
+	ManageServerMode ServerMode = "manage"
+
+	// LegacyServerMode serves the legacy web client, visible to users
+	// prior to release of tailscale/corp#14335.
+	LegacyServerMode ServerMode = "legacy"
 )
 
-// browserSession holds data about a user's browser session
-// on the full management web client.
-type browserSession struct {
-	// ID is the unique identifier for the session.
-	// It is passed in the user's "TS-Web-Session" browser cookie.
-	ID            string
-	SrcNode       tailcfg.StableNodeID
-	SrcUser       tailcfg.UserID
-	AuthURL       string    // control server URL for user to authenticate the session
-	Authenticated time.Time // when zero, authentication not complete
-}
-
-// isAuthorized reports true if the given session is authorized
-// to be used by its associated user to access the full management
-// web client.
-//
-// isAuthorized is true only when s.Authenticated is non-zero
-// (i.e. the user has authenticated the session) and the session
-// is not expired.
-// 2023-10-05: Sessions expire by default after 30 days.
-func (s *browserSession) isAuthorized() bool {
-	switch {
-	case s == nil:
-		return false
-	case s.Authenticated.IsZero():
-		return false // awaiting auth
-	case s.isExpired(): // TODO: add time field to server?
-		return false // expired
-	}
-	return true
-}
-
-// isExpired reports true if s is expired.
-// 2023-10-05: Sessions expire by default after 30 days.
-// If s.Authenticated is zero, isExpired reports false.
-func (s *browserSession) isExpired() bool {
-	return !s.Authenticated.IsZero() && s.Authenticated.Before(time.Now().Add(-sessionCookieExpiry)) // TODO: add time field to server?
-}
+var (
+	exitNodeRouteV4 = netip.MustParsePrefix("0.0.0.0/0")
+	exitNodeRouteV6 = netip.MustParsePrefix("::/0")
+)
 
 // ServerOpts contains options for constructing a new Server.
 type ServerOpts struct {
-	DevMode bool
-
-	// LoginOnly indicates that the server should only serve the minimal
-	// login client and not the full web client.
-	LoginOnly bool
+	// Mode specifies the mode of web client being constructed.
+	Mode ServerMode
 
 	// CGIMode indicates if the server is running as a CGI script.
 	CGIMode bool
@@ -122,20 +117,50 @@ type ServerOpts struct {
 	// LocalClient is the tailscale.LocalClient to use for this web server.
 	// If nil, a new one will be created.
 	LocalClient *tailscale.LocalClient
+
+	// TimeNow optionally provides a time function.
+	// time.Now is used as default.
+	TimeNow func() time.Time
+
+	// Logf optionally provides a logger function.
+	// log.Printf is used as default.
+	Logf logger.Logf
 }
 
 // NewServer constructs a new Tailscale web client server.
-func NewServer(opts ServerOpts) (s *Server, cleanup func()) {
+// If err is empty, s is always non-nil.
+// ctx is only required to live the duration of the NewServer call,
+// and not the lifespan of the web server.
+func NewServer(opts ServerOpts) (s *Server, err error) {
+	switch opts.Mode {
+	case LoginServerMode, ManageServerMode, LegacyServerMode:
+		// valid types
+	case "":
+		return nil, fmt.Errorf("must specify a Mode")
+	default:
+		return nil, fmt.Errorf("invalid Mode provided")
+	}
 	if opts.LocalClient == nil {
 		opts.LocalClient = &tailscale.LocalClient{}
 	}
 	s = &Server{
-		devMode:    opts.DevMode,
+		mode:       opts.Mode,
+		logf:       opts.Logf,
+		devMode:    envknob.Bool("TS_DEBUG_WEB_CLIENT_DEV"),
 		lc:         opts.LocalClient,
+		cgiMode:    opts.CGIMode,
 		pathPrefix: opts.PathPrefix,
+		timeNow:    opts.TimeNow,
 	}
-	s.tsDebugMode = s.debugMode()
-	s.assetsHandler, cleanup = assetsHandler(opts.DevMode)
+	if s.timeNow == nil {
+		s.timeNow = time.Now
+	}
+	if s.logf == nil {
+		s.logf = log.Printf
+	}
+	s.assetsHandler, s.assetsCleanup = assetsHandler(s.devMode)
+
+	var metric string // clientmetric to report on startup
 
 	// Create handler for "/api" requests with CSRF protection.
 	// We don't require secure cookies, since the web client is regularly used
@@ -143,31 +168,30 @@ func NewServer(opts ServerOpts) (s *Server, cleanup func()) {
 	// The client is secured by limiting the interface it listens on,
 	// or by authenticating requests before they reach the web client.
 	csrfProtect := csrf.Protect(s.csrfKey(), csrf.Secure(false))
-	if s.tsDebugMode == "login" {
-		// For the login client, we don't serve the full web client API,
-		// only the login endpoints.
+	if s.mode == LoginServerMode {
 		s.apiHandler = csrfProtect(http.HandlerFunc(s.serveLoginAPI))
-		s.lc.IncrementCounter(context.Background(), "web_login_client_initialization", 1)
+		metric = "web_login_client_initialization"
 	} else {
 		s.apiHandler = csrfProtect(http.HandlerFunc(s.serveAPI))
-		s.lc.IncrementCounter(context.Background(), "web_client_initialization", 1)
+		metric = "web_client_initialization"
 	}
 
-	return s, cleanup
+	// Don't block startup on reporting metric.
+	// Report in separate go routine with 5 second timeout.
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		s.lc.IncrementCounter(ctx, metric, 1)
+	}()
+
+	return s, nil
 }
 
-// debugMode returns the debug mode the web client is being run in.
-// The empty string is returned in the case that this instance is
-// not running in any debug mode.
-func (s *Server) debugMode() string {
-	if !s.devMode {
-		return "" // debug modes only available in dev
+func (s *Server) Shutdown() {
+	s.logf("web.Server: shutting down")
+	if s.assetsCleanup != nil {
+		s.assetsCleanup()
 	}
-	switch mode := os.Getenv("TS_DEBUG_WEB_CLIENT_MODE"); mode {
-	case "login", "full": // valid debug modes
-		return mode
-	}
-	return ""
 }
 
 // ServeHTTP processes all requests for the Tailscale web client.
@@ -183,42 +207,142 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
+	if s.mode == ManageServerMode {
+		// In manage mode, requests must be sent directly to the bare Tailscale IP address.
+		// If a request comes in on any other hostname, redirect.
+		if s.requireTailscaleIP(w, r) {
+			return // user was redirected
+		}
+
+		// serve HTTP 204 on /ok requests as connectivity check
+		if r.Method == httpm.GET && r.URL.Path == "/ok" {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+
+		if !s.devMode {
+			w.Header().Set("X-Frame-Options", "DENY")
+			// TODO: use CSP nonce or hash to eliminate need for unsafe-inline
+			w.Header().Set("Content-Security-Policy", "default-src 'self' 'unsafe-inline'; img-src * data:")
+			w.Header().Set("Cross-Origin-Resource-Policy", "same-origin")
+		}
+	}
+
 	if strings.HasPrefix(r.URL.Path, "/api/") {
+		switch {
+		case r.URL.Path == "/api/auth" && r.Method == httpm.GET:
+			s.serveAPIAuth(w, r) // serve auth status
+			return
+		case r.URL.Path == "/api/auth/session/new" && r.Method == httpm.GET:
+			s.serveAPIAuthSessionNew(w, r) // create new session
+			return
+		case r.URL.Path == "/api/auth/session/wait" && r.Method == httpm.GET:
+			s.serveAPIAuthSessionWait(w, r) // wait for session to be authorized
+			return
+		}
+		if ok := s.authorizeRequest(w, r); !ok {
+			http.Error(w, "not authorized", http.StatusUnauthorized)
+			return
+		}
 		// Pass API requests through to the API handler.
 		s.apiHandler.ServeHTTP(w, r)
 		return
 	}
 	if !s.devMode {
-		s.lc.IncrementCounter(context.Background(), "web_client_page_load", 1)
+		s.lc.IncrementCounter(r.Context(), "web_client_page_load", 1)
 	}
 	s.assetsHandler.ServeHTTP(w, r)
 }
 
-// authorizePlatformRequest reports whether the request from the web client
-// is authorized to access the client for those platforms that support it.
+// requireTailscaleIP redirects an incoming request if the HTTP request was not made to a bare Tailscale IP address.
+// The request will be redirected to the Tailscale IP, port 5252, with the original request path.
+// This allows any custom hostname to be used to access the device, but protects against DNS rebinding attacks.
+// Returns true if the request has been fully handled, either be returning a redirect or an HTTP error.
+func (s *Server) requireTailscaleIP(w http.ResponseWriter, r *http.Request) (handled bool) {
+	const (
+		ipv4ServiceHost = tsaddr.TailscaleServiceIPString
+		ipv6ServiceHost = "[" + tsaddr.TailscaleServiceIPv6String + "]"
+	)
+	// allow requests on quad-100 (or ipv6 equivalent)
+	if r.Host == ipv4ServiceHost || r.Host == ipv6ServiceHost {
+		return false
+	}
+
+	st, err := s.lc.StatusWithoutPeers(r.Context())
+	if err != nil {
+		s.logf("error getting status: %v", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return true
+	}
+
+	var ipv4 string // store the first IPv4 address we see for redirect later
+	for _, ip := range st.Self.TailscaleIPs {
+		if ip.Is4() {
+			if r.Host == fmt.Sprintf("%s:%d", ip, ListenPort) {
+				return false
+			}
+			ipv4 = ip.String()
+		}
+		if ip.Is6() && r.Host == fmt.Sprintf("[%s]:%d", ip, ListenPort) {
+			return false
+		}
+	}
+	newURL := *r.URL
+	newURL.Host = fmt.Sprintf("%s:%d", ipv4, ListenPort)
+	http.Redirect(w, r, newURL.String(), http.StatusMovedPermanently)
+	return true
+}
+
+// authorizeRequest reports whether the request from the web client
+// is authorized to be completed.
 // It reports true if the request is authorized, and false otherwise.
-// authorizePlatformRequest manages writing out any relevant authorization
+// authorizeRequest manages writing out any relevant authorization
 // errors to the ResponseWriter itself.
-func authorizePlatformRequest(w http.ResponseWriter, r *http.Request) (ok bool) {
+func (s *Server) authorizeRequest(w http.ResponseWriter, r *http.Request) (ok bool) {
+	if s.mode == ManageServerMode { // client using tailscale auth
+		_, err := s.lc.WhoIs(r.Context(), r.RemoteAddr)
+		switch {
+		case err != nil:
+			// All requests must be made over tailscale.
+			http.Error(w, "must access over tailscale", http.StatusUnauthorized)
+			return false
+		case r.URL.Path == "/api/data" && r.Method == httpm.GET:
+			// Readonly endpoint allowed without browser session.
+			return true
+		case strings.HasPrefix(r.URL.Path, "/api/"):
+			// All other /api/ endpoints require a valid browser session.
+			//
+			// TODO(sonia): s.getSession calls whois again,
+			// should try and use the above call instead of running another
+			// localapi request.
+			session, _, err := s.getSession(r)
+			if err != nil || !session.isAuthorized(s.timeNow()) {
+				http.Error(w, "no valid session", http.StatusUnauthorized)
+				return false
+			}
+			return true
+		default:
+			// No additional auth on non-api (assets, index.html, etc).
+			return true
+		}
+	}
+	// Client using system-specific auth.
 	switch distro.Get() {
 	case distro.Synology:
-		return authorizeSynology(w, r)
+		authorized, _ := authorizeSynology(r)
+		return authorized
 	case distro.QNAP:
-		return authorizeQNAP(w, r)
+		authorized, _ := authorizeQNAP(r)
+		return authorized
+	default:
+		return true // no additional auth for this distro
 	}
-	return true
 }
 
 // serveLoginAPI serves requests for the web login client.
 // It should only be called by Server.ServeHTTP, via Server.apiHandler,
 // which protects the handler using gorilla csrf.
 func (s *Server) serveLoginAPI(w http.ResponseWriter, r *http.Request) {
-	// The login client is run directly from client plugins,
-	// so first authenticate and authorize the request for the host platform.
-	if ok := authorizePlatformRequest(w, r); !ok {
-		return
-	}
-
 	w.Header().Set("X-CSRF-Token", csrf.Token(r))
 	if r.URL.Path != "/api/data" { // only endpoint allowed for login client
 		http.Error(w, "invalid endpoint", http.StatusNotFound)
@@ -228,141 +352,146 @@ func (s *Server) serveLoginAPI(w http.ResponseWriter, r *http.Request) {
 	case httpm.GET:
 		// TODO(soniaappasamy): we may want a minimal node data response here
 		s.serveGetNodeData(w, r)
-	case httpm.POST:
-		// TODO(soniaappasamy): implement
-	default:
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
 	}
+	http.Error(w, "invalid endpoint", http.StatusNotFound)
 	return
 }
 
+type authType string
+
 var (
-	errNoSession         = errors.New("no-browser-session")
-	errNotUsingTailscale = errors.New("not-using-tailscale")
-	errTaggedSource      = errors.New("tagged-source")
-	errNotOwner          = errors.New("not-owner")
+	synoAuth      authType = "synology"  // user needs a SynoToken for subsequent API calls
+	tailscaleAuth authType = "tailscale" // user needs to complete Tailscale check mode
 )
 
-// getTailscaleBrowserSession retrieves the browser session associated with
-// the request, if one exists.
-//
-// An error is returned in any of the following cases:
-//
-//   - (errNotUsingTailscale) The request was not made over tailscale.
-//
-//   - (errNoSession) The request does not have a session.
-//
-//   - (errTaggedSource) The source is a tagged node. Users must use their
-//     own user-owned devices to manage other nodes' web clients.
-//
-//   - (errNotOwner) The source is not the owner of this client (if the
-//     client is user-owned). Only the owner is allowed to manage the
-//     node via the web client.
-//
-// If no error is returned, the browserSession is always non-nil.
-// getTailscaleBrowserSession does not check whether the session has been
-// authorized by the user. Callers can use browserSession.isAuthorized.
-func (s *Server) getTailscaleBrowserSession(r *http.Request) (*browserSession, error) {
-	whoIs, err := s.lc.WhoIs(r.Context(), r.RemoteAddr)
-	switch {
-	case err != nil:
-		return nil, errNotUsingTailscale
-	case whoIs.Node.IsTagged():
-		return nil, errTaggedSource
-	}
-	srcNode := whoIs.Node.StableID
-	srcUser := whoIs.UserProfile.ID
-
-	status, err := s.lc.StatusWithoutPeers(r.Context())
-	switch {
-	case err != nil:
-		return nil, err
-	case status.Self == nil:
-		return nil, errors.New("missing self node in tailscale status")
-	case !status.Self.IsTagged() && status.Self.UserID != srcUser:
-		return nil, errNotOwner
-	}
-
-	cookie, err := r.Cookie(sessionCookieName)
-	if errors.Is(err, http.ErrNoCookie) {
-		return nil, errNoSession
-	} else if err != nil {
-		return nil, err
-	}
-	v, ok := s.browserSessions.Load(cookie.Value)
-	if !ok {
-		return nil, errNoSession
-	}
-	session := v.(*browserSession)
-	if session.SrcNode != srcNode || session.SrcUser != srcUser {
-		// In this case the browser cookie is associated with another tailscale node.
-		// Maybe the source browser's machine was logged out and then back in as a different node.
-		// Return errNoSession because there is no session for this user.
-		return nil, errNoSession
-	} else if session.isExpired() {
-		// Session expired, remove from session map and return errNoSession.
-		s.browserSessions.Delete(session.ID)
-		return nil, errNoSession
-	}
-	return session, nil
-}
-
 type authResponse struct {
-	OK      bool   `json:"ok"`                // true when user has valid auth session
-	AuthURL string `json:"authUrl,omitempty"` // filled when user has control auth action to take
-	Error   string `json:"error,omitempty"`   // filled when Ok is false
+	AuthNeeded     authType        `json:"authNeeded,omitempty"` // filled when user needs to complete a specific type of auth
+	CanManageNode  bool            `json:"canManageNode"`
+	ViewerIdentity *viewerIdentity `json:"viewerIdentity,omitempty"`
 }
 
-func (s *Server) serveTailscaleAuth(w http.ResponseWriter, r *http.Request) {
+// viewerIdentity is the Tailscale identity of the source node
+// connected to this web client.
+type viewerIdentity struct {
+	LoginName     string `json:"loginName"`
+	NodeName      string `json:"nodeName"`
+	NodeIP        string `json:"nodeIP"`
+	ProfilePicURL string `json:"profilePicUrl,omitempty"`
+}
+
+// serverAPIAuth handles requests to the /api/auth endpoint
+// and returns an authResponse indicating the current auth state and any steps the user needs to take.
+func (s *Server) serveAPIAuth(w http.ResponseWriter, r *http.Request) {
 	var resp authResponse
 
-	session, err := s.getTailscaleBrowserSession(r)
+	session, whois, err := s.getSession(r)
 	switch {
+	case err != nil && errors.Is(err, errNotUsingTailscale):
+		// not using tailscale, so perform platform auth
+		switch distro.Get() {
+		case distro.Synology:
+			authorized, err := authorizeSynology(r)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusUnauthorized)
+				return
+			}
+			if !authorized {
+				resp.AuthNeeded = synoAuth
+			}
+		case distro.QNAP:
+			if _, err := authorizeQNAP(r); err != nil {
+				http.Error(w, err.Error(), http.StatusUnauthorized)
+				return
+			}
+		default:
+			// no additional auth for this distro
+		}
+	case err != nil && (errors.Is(err, errNotOwner) ||
+		errors.Is(err, errNotUsingTailscale) ||
+		errors.Is(err, errTaggedLocalSource) ||
+		errors.Is(err, errTaggedRemoteSource)):
+		// These cases are all restricted to the readonly view.
+		// No auth action to take.
+		resp.AuthNeeded = ""
 	case err != nil && !errors.Is(err, errNoSession):
-		resp = authResponse{OK: false, Error: err.Error()}
-	case session == nil:
-		// TODO(tailscale/corp#14335): Create a new auth path from control,
-		// and store back to s.browserSessions and request cookie.
-	case !session.isAuthorized():
-		// TODO(tailscale/corp#14335): Check on the session auth path status from control,
-		// and store back to s.browserSessions.
-	default:
-		resp = authResponse{OK: true}
-	}
-
-	if err := json.NewEncoder(w).Encode(resp); err != nil {
+		// Any other error.
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
+	case session.isAuthorized(s.timeNow()):
+		resp.CanManageNode = true
+		resp.AuthNeeded = ""
+	default:
+		resp.AuthNeeded = tailscaleAuth
 	}
-	w.Header().Set("Content-Type", "application/json")
+
+	if whois != nil {
+		resp.ViewerIdentity = &viewerIdentity{
+			LoginName:     whois.UserProfile.LoginName,
+			NodeName:      whois.Node.Name,
+			ProfilePicURL: whois.UserProfile.ProfilePicURL,
+		}
+		if addrs := whois.Node.Addresses; len(addrs) > 0 {
+			resp.ViewerIdentity.NodeIP = addrs[0].Addr().String()
+		}
+	}
+	writeJSON(w, resp)
+}
+
+type newSessionAuthResponse struct {
+	AuthURL string `json:"authUrl,omitempty"`
+}
+
+// serveAPIAuthSessionNew handles requests to the /api/auth/session/new endpoint.
+func (s *Server) serveAPIAuthSessionNew(w http.ResponseWriter, r *http.Request) {
+	session, whois, err := s.getSession(r)
+	if err != nil && !errors.Is(err, errNoSession) {
+		// Source associated with request not allowed to create
+		// a session for this web client.
+		http.Error(w, err.Error(), http.StatusUnauthorized)
+		return
+	}
+	if session == nil {
+		// Create a new session.
+		// If one already existed, we return that authURL rather than creating a new one.
+		session, err = s.newSession(r.Context(), whois)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		// Set the cookie on browser.
+		http.SetCookie(w, &http.Cookie{
+			Name:    sessionCookieName,
+			Value:   session.ID,
+			Raw:     session.ID,
+			Path:    "/",
+			Expires: session.expires(),
+		})
+	}
+
+	writeJSON(w, newSessionAuthResponse{AuthURL: session.AuthURL})
+}
+
+// serveAPIAuthSessionWait handles requests to the /api/auth/session/wait endpoint.
+func (s *Server) serveAPIAuthSessionWait(w http.ResponseWriter, r *http.Request) {
+	session, _, err := s.getSession(r)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusUnauthorized)
+		return
+	}
+	if session.isAuthorized(s.timeNow()) {
+		return // already authorized
+	}
+	if err := s.awaitUserAuth(r.Context(), session); err != nil {
+		http.Error(w, err.Error(), http.StatusUnauthorized)
+		return
+	}
 }
 
 // serveAPI serves requests for the web client api.
 // It should only be called by Server.ServeHTTP, via Server.apiHandler,
 // which protects the handler using gorilla csrf.
 func (s *Server) serveAPI(w http.ResponseWriter, r *http.Request) {
-	if s.tsDebugMode == "full" {
-		// tailscale/corp#14335: Only restrict to tailscale auth in debug "full" web client mode.
-		// TODO(sonia,will): Switch serveAPI over to always require TS auth when we're ready
-		// to remove the debug flags.
-		// For now, existing client uses platform auth (else case below).
-
-		if r.URL.Path == "/api/auth" {
-			// Serve auth, which creates a new session for the user to authenticate,
-			// in the case that the request doesn't already have one.
-			s.serveTailscaleAuth(w, r)
-			return
-		}
-		// For all other endpoints, require a valid session to proceed.
-		session, err := s.getTailscaleBrowserSession(r)
-		if err != nil || !session.isAuthorized() {
-			http.Error(w, "no valid session", http.StatusUnauthorized)
-			return
-		}
-	} else if ok := authorizePlatformRequest(w, r); !ok {
-		return
-	}
-
 	w.Header().Set("X-CSRF-Token", csrf.Token(r))
 	path := strings.TrimPrefix(r.URL.Path, "/api")
 	switch {
@@ -384,20 +513,37 @@ func (s *Server) serveAPI(w http.ResponseWriter, r *http.Request) {
 }
 
 type nodeData struct {
-	Profile           tailcfg.UserProfile
-	Status            string
-	DeviceName        string
-	IP                string
+	ID          tailcfg.StableNodeID
+	Status      string
+	DeviceName  string
+	TailnetName string // TLS cert name
+	DomainName  string
+	IP          string // IPv4
+	IPv6        string
+	OS          string
+	IPNVersion  string
+
+	Profile  tailcfg.UserProfile
+	IsTagged bool
+	Tags     []string
+
+	KeyExpiry  string // time.RFC3339
+	KeyExpired bool
+
+	TUNMode     bool
+	IsSynology  bool
+	DSMVersion  int // 6 or 7, if IsSynology=true
+	IsUnraid    bool
+	UnraidToken string
+	URLPrefix   string // if set, the URL prefix the client is served behind
+
 	AdvertiseExitNode bool
 	AdvertiseRoutes   string
-	LicensesURL       string
-	TUNMode           bool
-	IsSynology        bool
-	DSMVersion        int // 6 or 7, if IsSynology=true
-	IsUnraid          bool
-	UnraidToken       string
-	IPNVersion        string
-	DebugMode         string // empty when not running in any debug mode
+	RunningSSHServer  bool
+
+	LicensesURL string
+
+	DebugMode string // empty when not running in any debug mode
 }
 
 func (s *Server) serveGetNodeData(w http.ResponseWriter, r *http.Request) {
@@ -411,24 +557,51 @@ func (s *Server) serveGetNodeData(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	profile := st.User[st.Self.UserID]
-	deviceName := strings.Split(st.Self.DNSName, ".")[0]
-	versionShort := strings.Split(st.Version, "-")[0]
-	data := &nodeData{
-		Profile:     profile,
-		Status:      st.BackendState,
-		DeviceName:  deviceName,
-		LicensesURL: licenses.LicensesURL(),
-		TUNMode:     st.TUN,
-		IsSynology:  distro.Get() == distro.Synology || envknob.Bool("TS_FAKE_SYNOLOGY"),
-		DSMVersion:  distro.DSMVersion(),
-		IsUnraid:    distro.Get() == distro.Unraid,
-		UnraidToken: os.Getenv("UNRAID_CSRF_TOKEN"),
-		IPNVersion:  versionShort,
-		DebugMode:   s.tsDebugMode,
+	var debugMode string
+	if s.mode == ManageServerMode {
+		debugMode = "full"
+	} else if s.mode == LoginServerMode {
+		debugMode = "login"
 	}
-	exitNodeRouteV4 := netip.MustParsePrefix("0.0.0.0/0")
-	exitNodeRouteV6 := netip.MustParsePrefix("::/0")
+	data := &nodeData{
+		ID:               st.Self.ID,
+		Status:           st.BackendState,
+		DeviceName:       strings.Split(st.Self.DNSName, ".")[0],
+		OS:               st.Self.OS,
+		IPNVersion:       strings.Split(st.Version, "-")[0],
+		Profile:          st.User[st.Self.UserID],
+		IsTagged:         st.Self.IsTagged(),
+		KeyExpired:       st.Self.Expired,
+		TUNMode:          st.TUN,
+		IsSynology:       distro.Get() == distro.Synology || envknob.Bool("TS_FAKE_SYNOLOGY"),
+		DSMVersion:       distro.DSMVersion(),
+		IsUnraid:         distro.Get() == distro.Unraid,
+		UnraidToken:      os.Getenv("UNRAID_CSRF_TOKEN"),
+		RunningSSHServer: prefs.RunSSH,
+		URLPrefix:        strings.TrimSuffix(s.pathPrefix, "/"),
+		LicensesURL:      licenses.LicensesURL(),
+		DebugMode:        debugMode, // TODO(sonia,will): just pass back s.mode directly?
+	}
+	for _, ip := range st.TailscaleIPs {
+		if ip.Is4() {
+			data.IP = ip.String()
+		} else if ip.Is6() {
+			data.IPv6 = ip.String()
+		}
+		if data.IP != "" && data.IPv6 != "" {
+			break
+		}
+	}
+	if st.CurrentTailnet != nil {
+		data.TailnetName = st.CurrentTailnet.MagicDNSSuffix
+		data.DomainName = st.CurrentTailnet.Name
+	}
+	if st.Self.Tags != nil {
+		data.Tags = st.Self.Tags.AsSlice()
+	}
+	if st.Self.KeyExpiry != nil {
+		data.KeyExpiry = st.Self.KeyExpiry.Format(time.RFC3339)
+	}
 	for _, r := range prefs.AdvertiseRoutes {
 		if r == exitNodeRouteV4 || r == exitNodeRouteV6 {
 			data.AdvertiseExitNode = true
@@ -439,14 +612,7 @@ func (s *Server) serveGetNodeData(w http.ResponseWriter, r *http.Request) {
 			data.AdvertiseRoutes += r.String()
 		}
 	}
-	if len(st.TailscaleIPs) != 0 {
-		data.IP = st.TailscaleIPs[0].String()
-	}
-	if err := json.NewEncoder(w).Encode(*data); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	w.Header().Set("Content-Type", "application/json")
+	writeJSON(w, *data)
 }
 
 type nodeUpdate struct {
@@ -473,6 +639,22 @@ func (s *Server) servePostNodeUpdate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	prefs, err := s.lc.GetPrefs(r.Context())
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	isCurrentlyExitNode := slices.Contains(prefs.AdvertiseRoutes, exitNodeRouteV4) || slices.Contains(prefs.AdvertiseRoutes, exitNodeRouteV6)
+
+	if postData.AdvertiseExitNode != isCurrentlyExitNode {
+		if postData.AdvertiseExitNode {
+			s.lc.IncrementCounter(r.Context(), "web_client_advertise_exitnode_enable", 1)
+		} else {
+			s.lc.IncrementCounter(r.Context(), "web_client_advertise_exitnode_disable", 1)
+		}
+	}
+
 	routes, err := netutil.CalcAdvertiseRoutes(postData.AdvertiseRoutes, postData.AdvertiseExitNode)
 	if err != nil {
 		w.WriteHeader(http.StatusInternalServerError)
@@ -485,7 +667,7 @@ func (s *Server) servePostNodeUpdate(w http.ResponseWriter, r *http.Request) {
 	}
 	mp.Prefs.WantRunning = true
 	mp.Prefs.AdvertiseRoutes = routes
-	log.Printf("Doing edit: %v", mp.Pretty())
+	s.logf("Doing edit: %v", mp.Pretty())
 
 	if _, err := s.lc.EditPrefs(r.Context(), mp); err != nil {
 		w.WriteHeader(http.StatusInternalServerError)
@@ -501,9 +683,9 @@ func (s *Server) servePostNodeUpdate(w http.ResponseWriter, r *http.Request) {
 	if postData.ForceLogout {
 		logout = true
 	}
-	log.Printf("tailscaleUp(reauth=%v, logout=%v) ...", reauth, logout)
+	s.logf("tailscaleUp(reauth=%v, logout=%v) ...", reauth, logout)
 	url, err := s.tailscaleUp(r.Context(), st, postData)
-	log.Printf("tailscaleUp = (URL %v, %v)", url != "", err)
+	s.logf("tailscaleUp = (URL %v, %v)", url != "", err)
 	if err != nil {
 		w.WriteHeader(http.StatusInternalServerError)
 		json.NewEncoder(w).Encode(mi{"error": err.Error()})
@@ -622,12 +804,9 @@ func (s *Server) proxyRequestToLocalAPI(w http.ResponseWriter, r *http.Request) 
 // Rather than exposing all localapi endpoints over the proxy,
 // this limits to just the ones actually used from the web
 // client frontend.
-//
-// TODO(sonia,will): Shouldn't expand this beyond the existing
-// localapi endpoints until the larger web client auth story
-// is worked out (tailscale/corp#14335).
 var localapiAllowlist = []string{
 	"/v0/logout",
+	"/v0/prefs",
 }
 
 // csrfKey returns a key that can be used for CSRF protection.
@@ -686,5 +865,14 @@ func enforcePrefix(prefix string, h http.HandlerFunc) http.HandlerFunc {
 		}
 		prefix = strings.TrimSuffix(prefix, "/")
 		http.StripPrefix(prefix, h).ServeHTTP(w, r)
+	}
+}
+
+func writeJSON(w http.ResponseWriter, data any) {
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(data); err != nil {
+		w.Header().Set("Content-Type", "text/plain")
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
 	}
 }

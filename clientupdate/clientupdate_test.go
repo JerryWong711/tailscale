@@ -11,6 +11,8 @@ import (
 	"maps"
 	"os"
 	"path/filepath"
+	"slices"
+	"sort"
 	"strings"
 	"testing"
 )
@@ -79,84 +81,6 @@ func TestUpdateDebianAptSourcesListBytes(t *testing.T) {
 			}
 			if gotChange != tt.want {
 				t.Errorf("wrong result\n got: %q\nwant: %q", gotChange, tt.want)
-			}
-		})
-	}
-}
-
-func TestParseSoftwareupdateList(t *testing.T) {
-	tests := []struct {
-		name  string
-		input []byte
-		want  string
-	}{
-		{
-			name: "update-at-end-of-list",
-			input: []byte(`
-	 Software Update Tool
-
-	 Finding available software
-	 Software Update found the following new or updated software:
-			* Label: MacBookAirEFIUpdate2.4-2.4
-					 Title: MacBook Air EFI Firmware Update, Version: 2.4, Size: 3817K, Recommended: YES, Action: restart,
-			* Label: ProAppsQTCodecs-1.0
-					 Title: ProApps QuickTime codecs, Version: 1.0, Size: 968K, Recommended: YES,
-			* Label: Tailscale-1.23.4
-					 Title: The Tailscale VPN, Version: 1.23.4, Size: 1023K, Recommended: YES,
-`),
-			want: "Tailscale-1.23.4",
-		},
-		{
-			name: "update-in-middle-of-list",
-			input: []byte(`
-	 Software Update Tool
-
-	 Finding available software
-	 Software Update found the following new or updated software:
-			* Label: MacBookAirEFIUpdate2.4-2.4
-					 Title: MacBook Air EFI Firmware Update, Version: 2.4, Size: 3817K, Recommended: YES, Action: restart,
-			* Label: Tailscale-1.23.5000
-					 Title: The Tailscale VPN, Version: 1.23.4, Size: 1023K, Recommended: YES,
-			* Label: ProAppsQTCodecs-1.0
-					 Title: ProApps QuickTime codecs, Version: 1.0, Size: 968K, Recommended: YES,
-`),
-			want: "Tailscale-1.23.5000",
-		},
-		{
-			name: "update-not-in-list",
-			input: []byte(`
-	 Software Update Tool
-
-	 Finding available software
-	 Software Update found the following new or updated software:
-			* Label: MacBookAirEFIUpdate2.4-2.4
-					 Title: MacBook Air EFI Firmware Update, Version: 2.4, Size: 3817K, Recommended: YES, Action: restart,
-			* Label: ProAppsQTCodecs-1.0
-					 Title: ProApps QuickTime codecs, Version: 1.0, Size: 968K, Recommended: YES,
-`),
-			want: "",
-		},
-		{
-			name: "decoy-in-list",
-			input: []byte(`
-	 Software Update Tool
-
-	 Finding available software
-	 Software Update found the following new or updated software:
-			* Label: MacBookAirEFIUpdate2.4-2.4
-					 Title: MacBook Air EFI Firmware Update, Version: 2.4, Size: 3817K, Recommended: YES, Action: restart,
-			* Label: Malware-1.0
-					 Title: * Label: Tailscale-0.99.0, Version: 1.0, Size: 968K, Recommended: NOT REALLY TBH,
-`),
-			want: "",
-		},
-	}
-
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			got := parseSoftwareupdateList(test.input)
-			if test.want != got {
-				t.Fatalf("got %q, want %q", got, test.want)
 			}
 		})
 	}
@@ -759,5 +683,115 @@ func TestWriteFileSymlink(t *testing.T) {
 		if string(got) != content {
 			t.Errorf("%q: got content %q, want %q", f, got, content)
 		}
+	}
+}
+
+func TestCleanupOldDownloads(t *testing.T) {
+	tests := []struct {
+		desc     string
+		before   []string
+		symlinks map[string]string
+		glob     string
+		after    []string
+	}{
+		{
+			desc: "MSIs",
+			before: []string{
+				"MSICache/tailscale-1.0.0.msi",
+				"MSICache/tailscale-1.1.0.msi",
+				"MSICache/readme.txt",
+			},
+			glob: "MSICache/*.msi",
+			after: []string{
+				"MSICache/readme.txt",
+			},
+		},
+		{
+			desc: "SPKs",
+			before: []string{
+				"tmp/tailscale-update-1/tailscale-1.0.0.spk",
+				"tmp/tailscale-update-2/tailscale-1.1.0.spk",
+				"tmp/readme.txt",
+				"tmp/tailscale-update-3",
+				"tmp/tailscale-update-4/tailscale-1.3.0",
+			},
+			glob: "tmp/tailscale-update*/*.spk",
+			after: []string{
+				"tmp/readme.txt",
+				"tmp/tailscale-update-3",
+				"tmp/tailscale-update-4/tailscale-1.3.0",
+			},
+		},
+		{
+			desc:   "empty-target",
+			before: []string{},
+			glob:   "tmp/tailscale-update*/*.spk",
+			after:  []string{},
+		},
+		{
+			desc: "keep-dirs",
+			before: []string{
+				"tmp/tailscale-update-1/tailscale-1.0.0.spk",
+			},
+			glob: "tmp/tailscale-update*",
+			after: []string{
+				"tmp/tailscale-update-1/tailscale-1.0.0.spk",
+			},
+		},
+		{
+			desc: "no-follow-symlinks",
+			before: []string{
+				"MSICache/tailscale-1.0.0.msi",
+				"MSICache/tailscale-1.1.0.msi",
+				"MSICache/readme.txt",
+			},
+			symlinks: map[string]string{
+				"MSICache/tailscale-1.3.0.msi": "MSICache/tailscale-1.0.0.msi",
+				"MSICache/tailscale-1.4.0.msi": "MSICache/readme.txt",
+			},
+			glob: "MSICache/*.msi",
+			after: []string{
+				"MSICache/tailscale-1.3.0.msi",
+				"MSICache/tailscale-1.4.0.msi",
+				"MSICache/readme.txt",
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.desc, func(t *testing.T) {
+			dir := t.TempDir()
+			for _, p := range tt.before {
+				if err := os.MkdirAll(filepath.Join(dir, filepath.Dir(p)), 0700); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(dir, p), []byte(tt.desc), 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			for from, to := range tt.symlinks {
+				if err := os.Symlink(filepath.Join(dir, to), filepath.Join(dir, from)); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			up := &Updater{Arguments: Arguments{Logf: t.Logf}}
+			up.cleanupOldDownloads(filepath.Join(dir, tt.glob))
+
+			var after []string
+			if err := filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
+				if !d.IsDir() {
+					after = append(after, strings.TrimPrefix(filepath.ToSlash(path), filepath.ToSlash(dir)+"/"))
+				}
+				return nil
+			}); err != nil {
+				t.Fatal(err)
+			}
+
+			sort.Strings(after)
+			sort.Strings(tt.after)
+			if !slices.Equal(after, tt.after) {
+				t.Errorf("got files after cleanup: %q, want: %q", after, tt.after)
+			}
+		})
 	}
 }

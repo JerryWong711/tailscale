@@ -113,7 +113,13 @@ func newUpFlagSet(goos string, upArgs *upArgsT, cmd string) *flag.FlagSet {
 	upf.StringVar(&upArgs.advertiseTags, "advertise-tags", "", "comma-separated ACL tags to request; each must start with \"tag:\" (e.g. \"tag:eng,tag:montreal,tag:ssh\")")
 	upf.StringVar(&upArgs.hostname, "hostname", "", "hostname to use instead of the one provided by the OS")
 	upf.StringVar(&upArgs.advertiseRoutes, "advertise-routes", "", "routes to advertise to other nodes (comma-separated, e.g. \"10.0.0.0/8,192.168.0.0/24\") or empty string to not advertise routes")
+	upf.BoolVar(&upArgs.advertiseConnector, "advertise-connector", false, "advertise this node as an app connector")
 	upf.BoolVar(&upArgs.advertiseDefaultRoute, "advertise-exit-node", false, "offer to be an exit node for internet traffic for the tailnet")
+
+	// TODO(tailscale/corp#14335): during development only expose -webclient on dev and unstable builds
+	if version.GetMeta().IsDev || version.IsUnstableBuild() {
+		upf.BoolVar(&upArgs.runWebClient, "webclient", false, "run a web client, permitting access per tailnet admin's declared policy")
+	}
 
 	if safesocket.GOOSUsesPeerCreds(goos) {
 		upf.StringVar(&upArgs.opUser, "operator", "", "Unix username to allow to operate on tailscaled without sudo")
@@ -160,11 +166,13 @@ type upArgsT struct {
 	exitNodeAllowLANAccess bool
 	shieldsUp              bool
 	runSSH                 bool
+	runWebClient           bool
 	forceReauth            bool
 	forceDaemon            bool
 	advertiseRoutes        string
 	advertiseDefaultRoute  bool
 	advertiseTags          string
+	advertiseConnector     bool
 	snat                   bool
 	netfilterMode          string
 	authKeyOrFile          string // "secret" or "file:/path/to/secret"
@@ -277,12 +285,14 @@ func prefsFromUpArgs(upArgs upArgsT, warnf logger.Logf, st *ipnstate.Status, goo
 	prefs.AllowSingleHosts = upArgs.singleRoutes
 	prefs.ShieldsUp = upArgs.shieldsUp
 	prefs.RunSSH = upArgs.runSSH
+	prefs.RunWebClient = upArgs.runWebClient
 	prefs.AdvertiseRoutes = routes
 	prefs.AdvertiseTags = tags
 	prefs.Hostname = upArgs.hostname
 	prefs.ForceDaemon = upArgs.forceDaemon
 	prefs.OperatorUser = upArgs.opUser
 	prefs.ProfileName = upArgs.profileName
+	prefs.AppConnector.Advertise = upArgs.advertiseConnector
 
 	if goos == "linux" {
 		prefs.NoSNAT = !upArgs.snat
@@ -432,9 +442,16 @@ func runUp(ctx context.Context, cmd string, args []string, upArgs upArgsT) (retE
 		fatalf("%s", err)
 	}
 
-	if len(prefs.AdvertiseRoutes) > 0 {
-		if err := localClient.CheckIPForwarding(context.Background()); err != nil {
+	if len(prefs.AdvertiseRoutes) > 0 || prefs.AppConnector.Advertise {
+		// TODO(jwhited): compress CheckIPForwarding and CheckUDPGROForwarding
+		//  into a single HTTP req.
+		if err := localClient.CheckIPForwarding(ctx); err != nil {
 			warnf("%v", err)
+		}
+		if runtime.GOOS == "linux" {
+			if err := localClient.CheckUDPGROForwarding(ctx); err != nil {
+				warnf("%v", err)
+			}
 		}
 	}
 
@@ -533,7 +550,11 @@ func runUp(ctx context.Context, cmd string, args []string, upArgs upArgsT) (retE
 						// Only need to print an update if we printed the "please click" message earlier.
 						fmt.Fprintf(Stderr, "Success.\n")
 						if cv != nil && !cv.RunningLatest && cv.LatestVersion != "" {
-							fmt.Fprintf(Stderr, "\nUpdate available: %v -> %v\n", version.Short(), cv.LatestVersion)
+							if cv.UrgentSecurityUpdate {
+								fmt.Fprintf(Stderr, "\nSecurity update available: %v -> %v\n", version.Short(), cv.LatestVersion)
+							} else {
+								fmt.Fprintf(Stderr, "\nUpdate available: %v -> %v\n", version.Short(), cv.LatestVersion)
+							}
 							fmt.Fprintln(Stderr, "Changelog: https://tailscale.com/changelog/#client")
 							fmt.Fprintln(Stderr, "Run `tailscale update` or `tailscale set --auto-update` to update")
 						}
@@ -723,9 +744,11 @@ func init() {
 	addPrefFlagMapping("unattended", "ForceDaemon")
 	addPrefFlagMapping("operator", "OperatorUser")
 	addPrefFlagMapping("ssh", "RunSSH")
+	addPrefFlagMapping("webclient", "RunWebClient")
 	addPrefFlagMapping("nickname", "ProfileName")
 	addPrefFlagMapping("update-check", "AutoUpdate")
 	addPrefFlagMapping("auto-update", "AutoUpdate")
+	addPrefFlagMapping("advertise-connector", "AppConnector")
 	addPrefFlagMapping("posture-checking", "PostureChecking")
 }
 
@@ -930,6 +953,8 @@ func prefsToFlags(env upCheckEnv, prefs *ipn.Prefs) (flagVal map[string]any) {
 			panic(fmt.Sprintf("unhandled flag %q", f.Name))
 		case "ssh":
 			set(prefs.RunSSH)
+		case "webclient":
+			set(prefs.RunWebClient)
 		case "login-server":
 			set(prefs.ControlURL)
 		case "accept-routes":
@@ -961,6 +986,8 @@ func prefsToFlags(env upCheckEnv, prefs *ipn.Prefs) (flagVal map[string]any) {
 			set(sb.String())
 		case "advertise-exit-node":
 			set(hasExitNodeRoutes(prefs.AdvertiseRoutes))
+		case "advertise-connector":
+			set(prefs.AppConnector.Advertise)
 		case "snat-subnet-routes":
 			set(!prefs.NoSNAT)
 		case "netfilter-mode":

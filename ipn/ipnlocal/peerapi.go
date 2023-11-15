@@ -15,6 +15,7 @@ import (
 	"net"
 	"net/http"
 	"net/netip"
+	"net/url"
 	"os"
 	"runtime"
 	"slices"
@@ -31,7 +32,6 @@ import (
 	"tailscale.com/health"
 	"tailscale.com/hostinfo"
 	"tailscale.com/ipn"
-	"tailscale.com/net/dns/resolver"
 	"tailscale.com/net/interfaces"
 	"tailscale.com/net/netaddr"
 	"tailscale.com/net/netutil"
@@ -40,6 +40,7 @@ import (
 	"tailscale.com/taildrop"
 	"tailscale.com/types/views"
 	"tailscale.com/util/clientmetric"
+	"tailscale.com/util/httphdr"
 	"tailscale.com/wgengine/filter"
 )
 
@@ -49,11 +50,16 @@ var initListenConfig func(*net.ListenConfig, netip.Addr, *interfaces.State, stri
 // ("cleartext" HTTP/2) support to the peerAPI.
 var addH2C func(*http.Server)
 
+// peerDNSQueryHandler is implemented by tsdns.Resolver.
+type peerDNSQueryHandler interface {
+	HandlePeerDNSQuery(context.Context, []byte, netip.AddrPort, func(name string) bool) (res []byte, err error)
+}
+
 type peerAPIServer struct {
 	b        *LocalBackend
-	resolver *resolver.Resolver
+	resolver peerDNSQueryHandler
 
-	taildrop *taildrop.Handler
+	taildrop *taildrop.Manager
 }
 
 var (
@@ -304,7 +310,9 @@ func (h *peerAPIHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 	}
 	if strings.HasPrefix(r.URL.Path, "/v0/put/") {
-		metricPutCalls.Add(1)
+		if r.Method == "PUT" {
+			metricPutCalls.Add(1)
+		}
 		h.handlePeerPut(w, r)
 		return
 	}
@@ -627,18 +635,95 @@ func (h *peerAPIHandler) peerHasCap(wantCap tailcfg.PeerCapability) bool {
 
 func (h *peerAPIHandler) handlePeerPut(w http.ResponseWriter, r *http.Request) {
 	if !h.canPutFile() {
-		http.Error(w, "Taildrop access denied", http.StatusForbidden)
+		http.Error(w, taildrop.ErrNoTaildrop.Error(), http.StatusForbidden)
 		return
 	}
 	if !h.ps.b.hasCapFileSharing() {
-		http.Error(w, "file sharing not enabled by Tailscale admin", http.StatusForbidden)
+		http.Error(w, taildrop.ErrNoTaildrop.Error(), http.StatusForbidden)
 		return
 	}
-	t0 := h.ps.b.clock.Now()
-	n, ok := h.ps.taildrop.HandlePut(w, r)
-	if ok {
-		d := h.ps.b.clock.Since(t0).Round(time.Second / 10)
-		h.logf("got put of %s in %v from %v/%v", approxSize(n), d, h.remoteAddr.Addr(), h.peerNode.ComputedName)
+	rawPath := r.URL.EscapedPath()
+	prefix, ok := strings.CutPrefix(rawPath, "/v0/put/")
+	if !ok {
+		http.Error(w, "misconfigured internals", http.StatusForbidden)
+		return
+	}
+	baseName, err := url.PathUnescape(prefix)
+	if err != nil {
+		http.Error(w, taildrop.ErrInvalidFileName.Error(), http.StatusBadRequest)
+		return
+	}
+	enc := json.NewEncoder(w)
+	switch r.Method {
+	case "GET":
+		id := taildrop.ClientID(h.peerNode.StableID())
+		if prefix == "" {
+			// List all the partial files.
+			files, err := h.ps.taildrop.PartialFiles(id)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			if err := enc.Encode(files); err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				h.logf("json.Encoder.Encode error: %v", err)
+				return
+			}
+		} else {
+			// Stream all the block hashes for the specified file.
+			next, close, err := h.ps.taildrop.HashPartialFile(id, baseName)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			defer close()
+			for {
+				switch cs, err := next(); {
+				case err == io.EOF:
+					return
+				case err != nil:
+					http.Error(w, err.Error(), http.StatusInternalServerError)
+					h.logf("HashPartialFile.next error: %v", err)
+					return
+				default:
+					if err := enc.Encode(cs); err != nil {
+						http.Error(w, err.Error(), http.StatusInternalServerError)
+						h.logf("json.Encoder.Encode error: %v", err)
+						return
+					}
+				}
+			}
+		}
+	case "PUT":
+		t0 := h.ps.b.clock.Now()
+		id := taildrop.ClientID(h.peerNode.StableID())
+
+		var offset int64
+		if rangeHdr := r.Header.Get("Range"); rangeHdr != "" {
+			ranges, ok := httphdr.ParseRange(rangeHdr)
+			if !ok || len(ranges) != 1 || ranges[0].Length != 0 {
+				http.Error(w, "invalid Range header", http.StatusBadRequest)
+				return
+			}
+			offset = ranges[0].Start
+		}
+		n, err := h.ps.taildrop.PutFile(taildrop.ClientID(fmt.Sprint(id)), baseName, r.Body, offset, r.ContentLength)
+		switch err {
+		case nil:
+			d := h.ps.b.clock.Since(t0).Round(time.Second / 10)
+			h.logf("got put of %s in %v from %v/%v", approxSize(n), d, h.remoteAddr.Addr(), h.peerNode.ComputedName)
+			io.WriteString(w, "{}\n")
+		case taildrop.ErrNoTaildrop:
+			http.Error(w, err.Error(), http.StatusForbidden)
+		case taildrop.ErrInvalidFileName:
+			http.Error(w, err.Error(), http.StatusBadRequest)
+		case taildrop.ErrFileExists:
+			http.Error(w, err.Error(), http.StatusConflict)
+		default:
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+		}
+	default:
+		http.Error(w, "expected method GET or PUT", http.StatusMethodNotAllowed)
 	}
 }
 
@@ -712,7 +797,7 @@ func (h *peerAPIHandler) handleServeDNSFwd(w http.ResponseWriter, r *http.Reques
 	}
 	dh := health.DebugHandler("dnsfwd")
 	if dh == nil {
-		http.Error(w, "not wired up", 500)
+		http.Error(w, "not wired up", http.StatusInternalServerError)
 		return
 	}
 	dh.ServeHTTP(w, r)
@@ -780,9 +865,9 @@ func (h *peerAPIHandler) replyToDNSQueries() bool {
 		return true
 	}
 	b := h.ps.b
-	if !b.OfferingExitNode() {
-		// If we're not an exit node, there's no point to
-		// being a DNS server for somebody.
+	if !b.OfferingExitNode() && !b.OfferingAppConnector() {
+		// If we're not an exit node or app connector, there's
+		// no point to being a DNS server for somebody.
 		return false
 	}
 	if !h.remoteAddr.IsValid() {
@@ -796,6 +881,13 @@ func (h *peerAPIHandler) replyToDNSQueries() bool {
 	// ourselves. As a proxy for autogroup:internet access, we see
 	// if we would've accepted a packet to 0.0.0.0:53. We treat
 	// the IP 0.0.0.0 as being "the internet".
+	//
+	// Because of the way that filter checks work, rules are only
+	// checked after ensuring the destination IP is part of the
+	// local set of IPs. An exit node has 0.0.0.0/0 so its fine,
+	// but an app connector explicitly adds 0.0.0.0/32 (and the
+	// IPv6 equivalent) to make this work (see updateFilterLocked
+	// in LocalBackend).
 	f := b.filterAtomic.Load()
 	if f == nil {
 		return false
@@ -846,16 +938,23 @@ func (h *peerAPIHandler) handleDNSQuery(w http.ResponseWriter, r *http.Request) 
 
 	ctx, cancel := context.WithTimeout(r.Context(), arbitraryTimeout)
 	defer cancel()
-	res, err := h.ps.resolver.HandleExitNodeDNSQuery(ctx, q, h.remoteAddr, h.ps.b.allowExitNodeDNSProxyToServeName)
+	res, err := h.ps.resolver.HandlePeerDNSQuery(ctx, q, h.remoteAddr, h.ps.b.allowExitNodeDNSProxyToServeName)
 	if err != nil {
 		h.logf("handleDNS fwd error: %v", err)
 		if err := ctx.Err(); err != nil {
-			http.Error(w, err.Error(), 500)
+			http.Error(w, err.Error(), http.StatusInternalServerError)
 		} else {
-			http.Error(w, "DNS forwarding error", 500)
+			http.Error(w, "DNS forwarding error", http.StatusInternalServerError)
 		}
 		return
 	}
+	// TODO(raggi): consider pushing the integration down into the resolver
+	// instead to avoid re-parsing the DNS response for improved performance in
+	// the future.
+	if h.ps.b.OfferingAppConnector() {
+		h.ps.b.ObserveDNSResponse(res)
+	}
+
 	if pretty {
 		// Non-standard response for interactive debugging.
 		w.Header().Set("Content-Type", "application/json")
@@ -911,7 +1010,7 @@ func dnsQueryForName(name, typStr string) []byte {
 	b := dnsmessage.NewBuilder(nil, dnsmessage.Header{
 		OpCode:           0, // query
 		RecursionDesired: true,
-		ID:               0,
+		ID:               1, // arbitrary, but 0 is rejected by some servers
 	})
 	if !strings.HasSuffix(name, ".") {
 		name += "."

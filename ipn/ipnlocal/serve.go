@@ -93,9 +93,9 @@ func (b *LocalBackend) newServeListener(ctx context.Context, ap netip.AddrPort, 
 			if handler == nil {
 				b.logf("[unexpected] local-serve: no handler for %v to port %v", srcAddr, ap.Port())
 				conn.Close()
+				return nil
 			}
-			handler(conn)
-			return nil
+			return handler(conn)
 		},
 		bo: backoff.NewBackoff("serve-listener", logf, 30*time.Second),
 	}
@@ -757,7 +757,8 @@ func (b *LocalBackend) serveFileOrDirectory(w http.ResponseWriter, r *http.Reque
 			http.NotFound(w, r)
 			return
 		}
-		http.Error(w, err.Error(), 500)
+		b.logf("error calling stat on %s: %v", fileOrDir, err)
+		http.Error(w, "an error occurred reading the file or directory", 500)
 		return
 	}
 	if fi.Mode().IsRegular() {
@@ -767,7 +768,8 @@ func (b *LocalBackend) serveFileOrDirectory(w http.ResponseWriter, r *http.Reque
 		}
 		f, err := os.Open(fileOrDir)
 		if err != nil {
-			http.Error(w, err.Error(), 500)
+			b.logf("error opening %s: %v", fileOrDir, err)
+			http.Error(w, "an error occurred reading the file or directory", 500)
 			return
 		}
 		defer f.Close()

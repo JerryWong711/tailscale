@@ -20,7 +20,7 @@ var (
 func main() {
 	flag.Parse()
 
-	s := new(tsnet.Server)
+	s := &tsnet.Server{RunWebClient: true}
 	defer s.Close()
 
 	lc, err := s.LocalClient()
@@ -30,7 +30,7 @@ func main() {
 
 	// Serve the Tailscale web client.
 	ws, err := web.NewServer(web.ServerOpts{
-		Mode:        web.LegacyServerMode,
+		Mode:        web.LoginServerMode,
 		LocalClient: lc,
 	})
 	if err != nil {

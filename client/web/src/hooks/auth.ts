@@ -1,3 +1,6 @@
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
+
 import { useCallback, useEffect, useState } from "react"
 import { apiFetch, setSynoToken } from "src/api"
 
@@ -25,11 +28,10 @@ export default function useAuth() {
 
   const loadAuth = useCallback(() => {
     setLoading(true)
-    return apiFetch("/auth", "GET")
-      .then((r) => r.json())
+    return apiFetch<AuthResponse>("/auth", "GET")
       .then((d) => {
         setData(d)
-        switch ((d as AuthResponse).authNeeded) {
+        switch (d.authNeeded) {
           case AuthType.synology:
             fetch("/webman/login.cgi")
               .then((r) => r.json())
@@ -50,29 +52,31 @@ export default function useAuth() {
   }, [])
 
   const newSession = useCallback(() => {
-    return apiFetch("/auth/session/new", "GET")
-      .then((r) => r.json())
+    return apiFetch<{ authUrl?: string }>("/auth/session/new", "GET")
       .then((d) => {
         if (d.authUrl) {
           window.open(d.authUrl, "_blank")
-          // refresh data when auth complete
-          apiFetch("/auth/session/wait", "GET").then(() => loadAuth())
+          return apiFetch("/auth/session/wait", "GET")
         }
+      })
+      .then(() => {
+        loadAuth()
       })
       .catch((error) => {
         console.error(error)
       })
-  }, [])
+  }, [loadAuth])
 
   useEffect(() => {
     loadAuth().then((d) => {
       if (
-        !d.canManageNode &&
-        new URLSearchParams(window.location.search).get("check") == "now"
+        !d?.canManageNode &&
+        new URLSearchParams(window.location.search).get("check") === "now"
       ) {
         newSession()
       }
     })
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
   return {

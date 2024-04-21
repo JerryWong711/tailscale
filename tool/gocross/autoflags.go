@@ -61,6 +61,8 @@ func autoflagsForTest(argv []string, env *Environment, goroot, nativeGOOS, nativ
 	}
 
 	switch targetOS {
+	case "android":
+		cgo = env.Get("CGO_ENABLED", "0") == "1"
 	case "linux":
 		// Getting Go to build a static binary with cgo enabled is a
 		// minor ordeal. The incantations you apparently need are
@@ -96,6 +98,7 @@ func autoflagsForTest(argv []string, env *Environment, goroot, nativeGOOS, nativ
 		cgo = true
 		buildFlags = append(buildFlags, "-buildmode=c-shared")
 		ldflags = append(ldflags, "-H", "windows", "-s")
+		cgoLdflags = append(cgoLdflags, "-static")
 		var mingwArch string
 		switch targetArch {
 		case "amd64":
@@ -127,6 +130,12 @@ func autoflagsForTest(argv []string, env *Environment, goroot, nativeGOOS, nativ
 			// Minimum OS version being targeted, results in
 			// e.g. -mmacosx-version-min=11.3, -miphoneos-version-min=15.0
 			switch {
+			case env.IsSet("XROS_DEPLOYMENT_TARGET"):
+				if env.Get("TARGET_DEVICE_PLATFORM_NAME", "") == "xrsimulator" {
+					xcodeFlags = append(xcodeFlags, "-mtargetos=xros"+env.Get("XROS_DEPLOYMENT_TARGET", "")+"-simulator")
+				} else {
+					xcodeFlags = append(xcodeFlags, "-mtargetos=xros"+env.Get("XROS_DEPLOYMENT_TARGET", ""))
+				}
 			case env.IsSet("IPHONEOS_DEPLOYMENT_TARGET"):
 				if env.Get("TARGET_DEVICE_PLATFORM_NAME", "") == "iphonesimulator" {
 					xcodeFlags = append(xcodeFlags, "-miphonesimulator-version-min="+env.Get("IPHONEOS_DEPLOYMENT_TARGET", ""))
@@ -190,6 +199,7 @@ func autoflagsForTest(argv []string, env *Environment, goroot, nativeGOOS, nativ
 	env.Set("CC", cc)
 	env.Set("TS_LINK_FAIL_REFLECT", boolStr(failReflect))
 	env.Set("GOROOT", goroot)
+	env.Set("GOTOOLCHAIN", "local")
 
 	if subcommand == "env" {
 		return argv, env, nil

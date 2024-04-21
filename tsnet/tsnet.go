@@ -46,7 +46,6 @@ import (
 	"tailscale.com/net/proxymux"
 	"tailscale.com/net/socks5"
 	"tailscale.com/net/tsdial"
-	"tailscale.com/smallzstd"
 	"tailscale.com/tsd"
 	"tailscale.com/types/logger"
 	"tailscale.com/types/logid"
@@ -428,7 +427,7 @@ func (s *Server) TailscaleIPs() (ip4, ip6 netip.Addr) {
 		return
 	}
 	addrs := nm.GetAddresses()
-	for i := range addrs.LenIter() {
+	for i := range addrs.Len() {
 		addr := addrs.At(i)
 		ip := addr.Addr()
 		if ip.Is6() {
@@ -530,7 +529,8 @@ func (s *Server) start() (reterr error) {
 	closePool.add(s.dialer)
 	sys.Set(eng)
 
-	ns, err := netstack.Create(logf, sys.Tun.Get(), eng, sys.MagicSock.Get(), s.dialer, sys.DNSManager.Get(), sys.ProxyMapper())
+	// TODO(oxtoacart): do we need to support Taildrive on tsnet, and if so, how?
+	ns, err := netstack.Create(logf, sys.Tun.Get(), eng, sys.MagicSock.Get(), s.dialer, sys.DNSManager.Get(), sys.ProxyMapper(), nil)
 	if err != nil {
 		return fmt.Errorf("netstack.Create: %w", err)
 	}
@@ -546,7 +546,13 @@ func (s *Server) start() (reterr error) {
 		return ok
 	}
 	s.dialer.NetstackDialTCP = func(ctx context.Context, dst netip.AddrPort) (net.Conn, error) {
-		return ns.DialContextTCP(ctx, dst)
+		// Note: don't just return ns.DialContextTCP or we'll
+		// return an interface containing a nil pointer.
+		tcpConn, err := ns.DialContextTCP(ctx, dst)
+		if err != nil {
+			return nil, err
+		}
+		return tcpConn, nil
 	}
 
 	if s.Store == nil {
@@ -591,7 +597,9 @@ func (s *Server) start() (reterr error) {
 	st := lb.State()
 	if st == ipn.NeedsLogin || envknob.Bool("TSNET_FORCE_LOGIN") {
 		logf("LocalBackend state is %v; running StartLoginInteractive...", st)
-		s.lb.StartLoginInteractive()
+		if err := s.lb.StartLoginInteractive(s.shutdownCtx); err != nil {
+			return fmt.Errorf("StartLoginInteractive: %w", err)
+		}
 	} else if authKey != "" {
 		logf("Authkey is set; but state is %v. Ignoring authkey. Re-run with TSNET_FORCE_LOGIN=1 to force use of authkey.", st)
 	}
@@ -644,17 +652,11 @@ func (s *Server) startLogger(closePool *closeOnErrorPool) error {
 	}
 	closePool.add(s.logbuffer)
 	c := logtail.Config{
-		Collection: lpc.Collection,
-		PrivateID:  lpc.PrivateID,
-		Stderr:     io.Discard, // log everything to Buffer
-		Buffer:     s.logbuffer,
-		NewZstdEncoder: func() logtail.Encoder {
-			w, err := smallzstd.NewEncoder(nil)
-			if err != nil {
-				panic(err)
-			}
-			return w
-		},
+		Collection:   lpc.Collection,
+		PrivateID:    lpc.PrivateID,
+		Stderr:       io.Discard, // log everything to Buffer
+		Buffer:       s.logbuffer,
+		CompressLogs: true,
 		HTTPC:        &http.Client{Transport: logpolicy.NewLogtailTransport(logtail.DefaultHost, s.netMon, s.logf)},
 		MetricsDelta: clientmetric.EncodeLogTailMetricsDelta,
 	}

@@ -5,6 +5,7 @@ package ipnlocal
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"crypto/sha256"
 	"crypto/tls"
@@ -29,7 +30,6 @@ import (
 	"tailscale.com/tsd"
 	"tailscale.com/types/logid"
 	"tailscale.com/types/netmap"
-	"tailscale.com/util/cmpx"
 	"tailscale.com/util/mak"
 	"tailscale.com/util/must"
 	"tailscale.com/wgengine"
@@ -157,8 +157,8 @@ func TestGetServeHandler(t *testing.T) {
 				},
 				TLS: &tls.ConnectionState{ServerName: serverName},
 			}
-			port := cmpx.Or(tt.port, 443)
-			req = req.WithContext(context.WithValue(req.Context(), serveHTTPContextKey{}, &serveHTTPContext{
+			port := cmp.Or(tt.port, 443)
+			req = req.WithContext(serveHTTPContextKey.WithValue(req.Context(), &serveHTTPContext{
 				DestPort: port,
 			}))
 
@@ -348,7 +348,109 @@ func TestServeConfigETag(t *testing.T) {
 	}
 }
 
-func TestServeHTTPProxy(t *testing.T) {
+func TestServeHTTPProxyPath(t *testing.T) {
+	b := newTestBackend(t)
+	// Start test serve endpoint.
+	testServ := httptest.NewServer(http.HandlerFunc(
+		func(w http.ResponseWriter, r *http.Request) {
+			// Set the request URL path to a response header, so the
+			// requested URL path can be checked in tests.
+			t.Logf("adding path %s", r.URL.Path)
+			w.Header().Add("Path", r.URL.Path)
+		},
+	))
+	defer testServ.Close()
+	tests := []struct {
+		name            string
+		mountPoint      string
+		proxyPath       string
+		requestPath     string
+		wantRequestPath string
+	}{
+		{
+			name:            "/foo -> /foo, with mount point and path /foo",
+			mountPoint:      "/foo",
+			proxyPath:       "/foo",
+			requestPath:     "/foo",
+			wantRequestPath: "/foo",
+		},
+		{
+			name:            "/foo/ -> /foo/, with mount point and path /foo",
+			mountPoint:      "/foo",
+			proxyPath:       "/foo",
+			requestPath:     "/foo/",
+			wantRequestPath: "/foo/",
+		},
+		{
+			name:            "/foo -> /foo/, with mount point and path /foo/",
+			mountPoint:      "/foo/",
+			proxyPath:       "/foo/",
+			requestPath:     "/foo",
+			wantRequestPath: "/foo/",
+		},
+		{
+			name:            "/-> /, with mount point and path /",
+			mountPoint:      "/",
+			proxyPath:       "/",
+			requestPath:     "/",
+			wantRequestPath: "/",
+		},
+		{
+			name:            "/foo -> /foo, with mount point and path /",
+			mountPoint:      "/",
+			proxyPath:       "/",
+			requestPath:     "/foo",
+			wantRequestPath: "/foo",
+		},
+		{
+			name:            "/foo/bar -> /foo/bar, with mount point and path /foo",
+			mountPoint:      "/foo",
+			proxyPath:       "/foo",
+			requestPath:     "/foo/bar",
+			wantRequestPath: "/foo/bar",
+		},
+		{
+			name:            "/foo/bar/baz -> /foo/bar/baz, with mount point and path /foo",
+			mountPoint:      "/foo",
+			proxyPath:       "/foo",
+			requestPath:     "/foo/bar/baz",
+			wantRequestPath: "/foo/bar/baz",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			conf := &ipn.ServeConfig{
+				Web: map[ipn.HostPort]*ipn.WebServerConfig{
+					"example.ts.net:443": {Handlers: map[string]*ipn.HTTPHandler{
+						tt.mountPoint: {Proxy: testServ.URL + tt.proxyPath},
+					}},
+				},
+			}
+			if err := b.SetServeConfig(conf, ""); err != nil {
+				t.Fatal(err)
+			}
+			req := &http.Request{
+				URL: &url.URL{Path: tt.requestPath},
+				TLS: &tls.ConnectionState{ServerName: "example.ts.net"},
+			}
+			req = req.WithContext(serveHTTPContextKey.WithValue(req.Context(),
+				&serveHTTPContext{
+					DestPort: 443,
+					SrcAddr:  netip.MustParseAddrPort("1.2.3.4:1234"), // random src
+				}))
+
+			w := httptest.NewRecorder()
+			b.serveWebHandler(w, req)
+
+			// Verify what path was requested
+			p := w.Result().Header.Get("Path")
+			if p != tt.wantRequestPath {
+				t.Errorf("wanted request path %s got %s", tt.wantRequestPath, p)
+			}
+		})
+	}
+}
+func TestServeHTTPProxyHeaders(t *testing.T) {
 	b := newTestBackend(t)
 
 	// Start test serve endpoint.
@@ -428,7 +530,7 @@ func TestServeHTTPProxy(t *testing.T) {
 				URL: &url.URL{Path: "/"},
 				TLS: &tls.ConnectionState{ServerName: "example.ts.net"},
 			}
-			req = req.WithContext(context.WithValue(req.Context(), serveHTTPContextKey{}, &serveHTTPContext{
+			req = req.WithContext(serveHTTPContextKey.WithValue(req.Context(), &serveHTTPContext{
 				DestPort: 443,
 				SrcAddr:  netip.MustParseAddrPort(tt.srcIP + ":1234"), // random src port for tests
 			}))
@@ -718,6 +820,24 @@ func Test_isGRPCContentType(t *testing.T) {
 	for _, tt := range tests {
 		if got := isGRPCContentType(tt.contentType); got != tt.want {
 			t.Errorf("isGRPCContentType(%q) = %v, want %v", tt.contentType, got, tt.want)
+		}
+	}
+}
+
+func TestEncTailscaleHeaderValue(t *testing.T) {
+	tests := []struct {
+		in   string
+		want string
+	}{
+		{"", ""},
+		{"Alice Smith", "Alice Smith"},
+		{"Bad\xffUTF-8", ""},
+		{"Krūmiņa", "=?utf-8?q?Kr=C5=ABmi=C5=86a?="},
+	}
+	for _, tt := range tests {
+		got := encTailscaleHeaderValue(tt.in)
+		if got != tt.want {
+			t.Errorf("encTailscaleHeaderValue(%q) = %q, want %q", tt.in, got, tt.want)
 		}
 	}
 }

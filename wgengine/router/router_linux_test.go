@@ -659,8 +659,9 @@ func (n *fakeIPTablesRunner) DelMagicsockPortRule(port uint16, network string) e
 	return nil
 }
 
-func (n *fakeIPTablesRunner) HasIPV6() bool    { return true }
-func (n *fakeIPTablesRunner) HasIPV6NAT() bool { return true }
+func (n *fakeIPTablesRunner) HasIPV6() bool       { return true }
+func (n *fakeIPTablesRunner) HasIPV6NAT() bool    { return true }
+func (n *fakeIPTablesRunner) HasIPV6Filter() bool { return true }
 
 // fakeOS implements commandRunner and provides v4 and v6
 // netfilterRunners, but captures changes without touching the OS.
@@ -908,7 +909,7 @@ func TestDelRouteIdempotent(t *testing.T) {
 			t.Error(err)
 			continue
 		}
-		for i := 0; i < 2; i++ {
+		for i := range 2 {
 			if err := lt.r.delRoute(cidr); err != nil {
 				t.Errorf("delRoute(i=%d): %v", i, err)
 			}

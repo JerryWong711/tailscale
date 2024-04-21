@@ -14,17 +14,21 @@ import (
 	"path/filepath"
 	"reflect"
 	"runtime"
+	"slices"
 	"strings"
 
 	"tailscale.com/atomicfile"
+	"tailscale.com/drive"
 	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/net/netaddr"
 	"tailscale.com/net/tsaddr"
 	"tailscale.com/tailcfg"
+	"tailscale.com/types/opt"
 	"tailscale.com/types/persist"
 	"tailscale.com/types/preftype"
 	"tailscale.com/types/views"
 	"tailscale.com/util/dnsname"
+	"tailscale.com/util/syspolicy"
 )
 
 // DefaultControlURL is the URL base of the control plane
@@ -54,7 +58,7 @@ type Prefs struct {
 	// is used. It's set non-empty once the daemon has been started
 	// for the first time.
 	//
-	// TODO(apenwarr): Make it safe to update this with SetPrefs().
+	// TODO(apenwarr): Make it safe to update this with EditPrefs().
 	// Right now, you have to pass it in the initial prefs in Start(),
 	// which is the only code that actually uses the ControlURL value.
 	// It would be more consistent to restart controlclient
@@ -101,6 +105,14 @@ type Prefs struct {
 	ExitNodeID tailcfg.StableNodeID
 	ExitNodeIP netip.Addr
 
+	// InternalExitNodePrior is the most recently used ExitNodeID in string form. It is set by
+	// the backend on transition from exit node on to off and used by the
+	// backend.
+	//
+	// As an Internal field, it can't be set by LocalAPI clients, rather it is set indirectly
+	// when the ExitNodeID value is zero'd and via the set-use-exit-node-enabled endpoint.
+	InternalExitNodePrior tailcfg.StableNodeID
+
 	// ExitNodeAllowLANAccess indicates whether locally accessible subnets should be
 	// routed directly or via the exit node.
 	ExitNodeAllowLANAccess bool
@@ -114,7 +126,8 @@ type Prefs struct {
 	// policies as configured by the Tailnet's admin(s).
 	RunSSH bool
 
-	// RunWebClient bool is whether this node should run a web client,
+	// RunWebClient bool is whether this node should expose
+	// its web client over Tailscale at port 5252,
 	// permitting access to peers according to the
 	// policies as configured by the Tailnet's admin(s).
 	RunWebClient bool
@@ -220,6 +233,10 @@ type Prefs struct {
 	// Linux-only.
 	NetfilterKind string
 
+	// DriveShares are the configured DriveShares, stored in increasing order
+	// by name.
+	DriveShares []*drive.Share
+
 	// The Persist field is named 'Config' in the file for backward
 	// compatibility with earlier versions.
 	// TODO(apenwarr): We should move this out of here, it's not a pref.
@@ -237,7 +254,17 @@ type AutoUpdatePrefs struct {
 	// Apply specifies whether background auto-updates are enabled. When
 	// enabled, tailscaled will apply available updates in the background.
 	// Check must also be set when Apply is set.
-	Apply bool
+	Apply opt.Bool
+}
+
+func (au1 AutoUpdatePrefs) Equals(au2 AutoUpdatePrefs) bool {
+	// This could almost be as easy as `au1.Apply == au2.Apply`, except that
+	// opt.Bool("") and opt.Bool("unset") should be treated as equal.
+	apply1, ok1 := au1.Apply.Get()
+	apply2, ok2 := au2.Apply.Get()
+	return au1.Check == au2.Check &&
+		apply1 == apply2 &&
+		ok1 == ok2
 }
 
 // AppConnectorPrefs are the app connector settings for the node agent.
@@ -260,6 +287,7 @@ type MaskedPrefs struct {
 	AllowSingleHostsSet       bool                `json:",omitempty"`
 	ExitNodeIDSet             bool                `json:",omitempty"`
 	ExitNodeIPSet             bool                `json:",omitempty"`
+	InternalExitNodePriorSet  bool                `json:",omitempty"` // Internal; can't be set by LocalAPI clients
 	ExitNodeAllowLANAccessSet bool                `json:",omitempty"`
 	CorpDNSSet                bool                `json:",omitempty"`
 	RunSSHSet                 bool                `json:",omitempty"`
@@ -281,6 +309,13 @@ type MaskedPrefs struct {
 	AppConnectorSet           bool                `json:",omitempty"`
 	PostureCheckingSet        bool                `json:",omitempty"`
 	NetfilterKindSet          bool                `json:",omitempty"`
+	DriveSharesSet            bool                `json:",omitempty"`
+}
+
+// SetsInternal reports whether mp has any of the Internal*Set field bools set
+// to true.
+func (mp *MaskedPrefs) SetsInternal() bool {
+	return mp.InternalExitNodePriorSet
 }
 
 type AutoUpdatePrefsMask struct {
@@ -328,7 +363,7 @@ func applyPrefsEdits(src, dst reflect.Value, mask map[string]reflect.Value) {
 
 func maskFields(v reflect.Value) map[string]reflect.Value {
 	mask := make(map[string]reflect.Value)
-	for i := 0; i < v.NumField(); i++ {
+	for i := range v.NumField() {
 		f := v.Type().Field(i).Name
 		if !strings.HasSuffix(f, "Set") {
 			continue
@@ -403,12 +438,20 @@ func (m *MaskedPrefs) Pretty() string {
 				continue
 			}
 			mpf := mpv.Field(i - 1)
-			prettyFn := mf.MethodByName("Pretty")
-			if !prettyFn.IsValid() {
-				panic(fmt.Sprintf("MaskedPrefs field %q is missing the Pretty method", name))
+			// This would be much simpler with reflect.MethodByName("Pretty"),
+			// but using MethodByName disables some linker optimizations and
+			// makes our binaries much larger. See
+			// https://github.com/tailscale/tailscale/issues/10627#issuecomment-1861211945
+			//
+			// Instead, have this explicit switch by field name to do type
+			// assertions.
+			switch name {
+			case "AutoUpdateSet":
+				p := mf.Interface().(AutoUpdatePrefsMask).Pretty(mpf.Interface().(AutoUpdatePrefs))
+				fmt.Fprintf(&sb, "%s={%s}", strings.TrimSuffix(name, "Set"), p)
+			default:
+				panic(fmt.Sprintf("unexpected MaskedPrefs field %q", name))
 			}
-			res := prettyFn.Call([]reflect.Value{mpf})
-			fmt.Fprintf(&sb, "%s={%s}", strings.TrimSuffix(name, "Set"), res[0].String())
 		}
 	}
 	sb.WriteString("}")
@@ -516,6 +559,7 @@ func (p *Prefs) Equals(p2 *Prefs) bool {
 		p.AllowSingleHosts == p2.AllowSingleHosts &&
 		p.ExitNodeID == p2.ExitNodeID &&
 		p.ExitNodeIP == p2.ExitNodeIP &&
+		p.InternalExitNodePrior == p2.InternalExitNodePrior &&
 		p.ExitNodeAllowLANAccess == p2.ExitNodeAllowLANAccess &&
 		p.CorpDNS == p2.CorpDNS &&
 		p.RunSSH == p2.RunSSH &&
@@ -533,14 +577,15 @@ func (p *Prefs) Equals(p2 *Prefs) bool {
 		compareStrings(p.AdvertiseTags, p2.AdvertiseTags) &&
 		p.Persist.Equals(p2.Persist) &&
 		p.ProfileName == p2.ProfileName &&
-		p.AutoUpdate == p2.AutoUpdate &&
+		p.AutoUpdate.Equals(p2.AutoUpdate) &&
 		p.AppConnector == p2.AppConnector &&
 		p.PostureChecking == p2.PostureChecking &&
+		slices.EqualFunc(p.DriveShares, p2.DriveShares, drive.SharesEqual) &&
 		p.NetfilterKind == p2.NetfilterKind
 }
 
 func (au AutoUpdatePrefs) Pretty() string {
-	if au.Apply {
+	if au.Apply.EqualBool(true) {
 		return "update=on "
 	}
 	if au.Check {
@@ -600,7 +645,7 @@ func NewPrefs() *Prefs {
 		NetfilterMode:    preftype.NetfilterOn,
 		AutoUpdate: AutoUpdatePrefs{
 			Check: true,
-			Apply: false,
+			Apply: opt.Bool("unset"),
 		},
 	}
 }
@@ -618,11 +663,16 @@ func (p PrefsView) ControlURLOrDefault() string {
 // If not configured, or if the configured value is a legacy name equivalent to
 // the default, then DefaultControlURL is returned instead.
 func (p *Prefs) ControlURLOrDefault() string {
-	if p.ControlURL != "" {
-		if p.ControlURL != DefaultControlURL && IsLoginServerSynonym(p.ControlURL) {
+	controlURL, err := syspolicy.GetString(syspolicy.ControlURL, p.ControlURL)
+	if err != nil {
+		controlURL = p.ControlURL
+	}
+
+	if controlURL != "" {
+		if controlURL != DefaultControlURL && IsLoginServerSynonym(controlURL) {
 			return DefaultControlURL
 		}
-		return p.ControlURL
+		return controlURL
 	}
 	return DefaultControlURL
 }

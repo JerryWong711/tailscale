@@ -80,8 +80,7 @@ func TestExpectedWindowsTypes(t *testing.T) {
 	}()
 
 	go func() {
-		s := DefaultConnectionStrategy(sock)
-		c, err := Connect(s)
+		c, err := Connect(sock)
 		if err != nil {
 			errs <- err
 			return
@@ -100,7 +99,7 @@ func TestExpectedWindowsTypes(t *testing.T) {
 		errs <- nil
 	}()
 
-	for i := 0; i < 2; i++ {
+	for range 2 {
 		if err := <-errs; err != nil {
 			t.Fatal(err)
 		}

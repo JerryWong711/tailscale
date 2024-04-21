@@ -21,7 +21,7 @@ func TestCreateOrGetMapping(t *testing.T) {
 	c := NewClient(t.Logf, nil, nil, new(controlknobs.Knobs), nil)
 	defer c.Close()
 	c.SetLocalPort(1234)
-	for i := 0; i < 2; i++ {
+	for i := range 2 {
 		if i > 0 {
 			time.Sleep(100 * time.Millisecond)
 		}
@@ -36,7 +36,7 @@ func TestClientProbe(t *testing.T) {
 	}
 	c := NewClient(t.Logf, nil, nil, new(controlknobs.Knobs), nil)
 	defer c.Close()
-	for i := 0; i < 3; i++ {
+	for i := range 3 {
 		if i > 0 {
 			time.Sleep(100 * time.Millisecond)
 		}
@@ -51,6 +51,7 @@ func TestClientProbeThenMap(t *testing.T) {
 	}
 	c := NewClient(t.Logf, nil, nil, new(controlknobs.Knobs), nil)
 	defer c.Close()
+	c.debug.VerboseLogs = true
 	c.SetLocalPort(1234)
 	res, err := c.Probe(context.Background())
 	t.Logf("Probe: %+v, %v", res, err)

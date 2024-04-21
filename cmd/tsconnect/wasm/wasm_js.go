@@ -90,8 +90,11 @@ func newIPN(jsConfig js.Value) map[string]any {
 	c := logtail.Config{
 		Collection: lpc.Collection,
 		PrivateID:  lpc.PrivateID,
-		// NewZstdEncoder is intentionally not passed in, compressed requests
-		// set HTTP headers that are not supported by the no-cors fetching mode.
+
+		// Compressed requests set HTTP headers that are not supported by the
+		// no-cors fetching mode:
+		CompressLogs: false,
+
 		HTTPC: &http.Client{Transport: &noCORSTransport{http.DefaultTransport}},
 	}
 	logtail := logtail.NewLogger(c, log.Printf)
@@ -110,7 +113,7 @@ func newIPN(jsConfig js.Value) map[string]any {
 	}
 	sys.Set(eng)
 
-	ns, err := netstack.Create(logf, sys.Tun.Get(), eng, sys.MagicSock.Get(), dialer, sys.DNSManager.Get(), sys.ProxyMapper())
+	ns, err := netstack.Create(logf, sys.Tun.Get(), eng, sys.MagicSock.Get(), dialer, sys.DNSManager.Get(), sys.ProxyMapper(), nil)
 	if err != nil {
 		log.Fatalf("netstack.Create: %v", err)
 	}
@@ -264,7 +267,7 @@ func (i *jsIPN) run(jsCallbacks js.Value) {
 						name = p.Hostinfo().Hostname()
 					}
 					addrs := make([]string, p.Addresses().Len())
-					for i := range p.Addresses().LenIter() {
+					for i := range p.Addresses().Len() {
 						addrs[i] = p.Addresses().At(i).Addr().String()
 					}
 					return jsNetMapPeerNode{
@@ -319,7 +322,7 @@ func (i *jsIPN) run(jsCallbacks js.Value) {
 }
 
 func (i *jsIPN) login() {
-	go i.lb.StartLoginInteractive()
+	go i.lb.StartLoginInteractive(context.Background())
 }
 
 func (i *jsIPN) logout() {
@@ -582,7 +585,7 @@ func mapSlice[T any, M any](a []T, f func(T) M) []M {
 
 func mapSliceView[T any, M any](a views.Slice[T], f func(T) M) []M {
 	n := make([]M, a.Len())
-	for i := range a.LenIter() {
+	for i := range a.Len() {
 		n[i] = f(a.At(i))
 	}
 	return n

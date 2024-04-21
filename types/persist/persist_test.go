@@ -12,7 +12,7 @@ import (
 )
 
 func fieldsOf(t reflect.Type) (fields []string) {
-	for i := 0; i < t.NumField(); i++ {
+	for i := range t.NumField() {
 		if name := t.Field(i).Name; name != "_" {
 			fields = append(fields, name)
 		}
@@ -22,7 +22,7 @@ func fieldsOf(t reflect.Type) (fields []string) {
 
 func TestPersistEqual(t *testing.T) {
 	persistHandles := []string{"LegacyFrontendPrivateMachineKey", "PrivateNodeKey", "OldPrivateNodeKey", "Provider", "UserProfile", "NetworkLockKey", "NodeID", "DisallowedTKAStateIDs"}
-	if have := fieldsOf(reflect.TypeOf(Persist{})); !reflect.DeepEqual(have, persistHandles) {
+	if have := fieldsOf(reflect.TypeFor[Persist]()); !reflect.DeepEqual(have, persistHandles) {
 		t.Errorf("Persist.Equal check might be out of sync\nfields: %q\nhandled: %q\n",
 			have, persistHandles)
 	}

@@ -42,6 +42,7 @@ import (
 	"golang.org/x/sys/windows/svc/eventlog"
 	"golang.zx2c4.com/wintun"
 	"golang.zx2c4.com/wireguard/windows/tunnel/winipcfg"
+	"tailscale.com/drive/driveimpl"
 	"tailscale.com/envknob"
 	"tailscale.com/logpolicy"
 	"tailscale.com/logtail/backoff"
@@ -314,6 +315,8 @@ func beWindowsSubprocess() bool {
 		log.Fatalf("Could not create netMon: %v", err)
 	}
 	sys.Set(netMon)
+
+	sys.Set(driveimpl.NewFileSystemForRemote(log.Printf))
 
 	publicLogID, _ := logid.ParsePublicID(logID)
 	err = startIPNServer(ctx, log.Printf, publicLogID, sys)

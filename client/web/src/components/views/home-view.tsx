@@ -3,22 +3,23 @@
 
 import cx from "classnames"
 import React, { useMemo } from "react"
-import { incrementMetric } from "src/api"
-import { ReactComponent as ArrowRight } from "src/assets/icons/arrow-right.svg"
-import { ReactComponent as Machine } from "src/assets/icons/machine.svg"
+import { apiFetch } from "src/api"
+import ArrowRight from "src/assets/icons/arrow-right.svg?react"
+import Machine from "src/assets/icons/machine.svg?react"
 import AddressCard from "src/components/address-copy-card"
 import ExitNodeSelector from "src/components/exit-node-selector"
+import { AuthResponse, canEdit } from "src/hooks/auth"
 import { NodeData } from "src/types"
 import Card from "src/ui/card"
 import { pluralize } from "src/utils/util"
 import { Link, useLocation } from "wouter"
 
 export default function HomeView({
-  readonly,
   node,
+  auth,
 }: {
-  readonly: boolean
   node: NodeData
+  auth: AuthResponse
 }) {
   const [allSubnetRoutes, pendingSubnetRoutes] = useMemo(
     () => [
@@ -63,12 +64,16 @@ export default function HomeView({
         </div>
         {(node.Features["advertise-exit-node"] ||
           node.Features["use-exit-node"]) && (
-          <ExitNodeSelector className="mb-5" node={node} disabled={readonly} />
+          <ExitNodeSelector
+            className="mb-5"
+            node={node}
+            disabled={!canEdit("exitnodes", auth)}
+          />
         )}
         <Link
           className="link font-medium"
           to="/details"
-          onClick={() => incrementMetric("web_client_device_details_click")}
+          onClick={() => apiFetch("/device-details-click", "POST")}
         >
           View device details &rarr;
         </Link>

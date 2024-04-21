@@ -1016,7 +1016,7 @@ func TestPublicKeyFetching(t *testing.T) {
 		pubKeyHTTPClient: ts.Client(),
 		timeNow:          clock.Now,
 	}
-	for i := 0; i < 2; i++ {
+	for range 2 {
 		got, err := srv.fetchPublicKeysURL(keys + "/alice.keys")
 		if err != nil {
 			t.Fatal(err)
@@ -1154,7 +1154,7 @@ func TestPathFromPAMEnvLineOnNixOS(t *testing.T) {
 }
 
 func TestStdOsUserUserAssumptions(t *testing.T) {
-	v := reflect.TypeOf(user.User{})
+	v := reflect.TypeFor[user.User]()
 	if got, want := v.NumField(), 5; got != want {
 		t.Errorf("os/user.User has %v fields; this package assumes %v", got, want)
 	}

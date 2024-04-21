@@ -251,6 +251,12 @@ func (s *Server) checkConnIdentityLocked(ci *ipnauth.ConnIdentity) error {
 				return err
 			}
 
+			// Always allow Windows SYSTEM user to connect,
+			// even if Tailscale is currently being used by another user.
+			if chkTok != nil && chkTok.IsLocalSystem() {
+				return nil
+			}
+
 			activeTok, err := active.WindowsToken()
 			if err == nil {
 				defer activeTok.Close()
@@ -336,7 +342,7 @@ func userIDFromString(v string) string {
 }
 
 func isAllDigit(s string) bool {
-	for i := 0; i < len(s); i++ {
+	for i := range len(s) {
 		if b := s[i]; b < '0' || b > '9' {
 			return false
 		}
@@ -401,8 +407,10 @@ func (s *Server) addActiveHTTPRequest(req *http.Request, ci *ipnauth.ConnIdentit
 			if !errors.Is(err, ipnauth.ErrNotImplemented) {
 				s.logf("error obtaining access token: %v", err)
 			}
-		} else {
-			// Tell the LocalBackend about the identity we're now running as.
+		} else if !token.IsLocalSystem() {
+			// Tell the LocalBackend about the identity we're now running as,
+			// unless its the SYSTEM user. That user is not a real account and
+			// doesn't have a home directory.
 			uid, err := lb.SetCurrentUser(token)
 			if err != nil {
 				token.Close()

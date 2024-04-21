@@ -20,12 +20,13 @@ import (
 	"tailscale.com/tailcfg"
 	"tailscale.com/tstest"
 	"tailscale.com/types/key"
+	"tailscale.com/types/opt"
 	"tailscale.com/types/persist"
 	"tailscale.com/types/preftype"
 )
 
 func fieldsOf(t reflect.Type) (fields []string) {
-	for i := 0; i < t.NumField(); i++ {
+	for i := range t.NumField() {
 		fields = append(fields, t.Field(i).Name)
 	}
 	return
@@ -40,6 +41,7 @@ func TestPrefsEqual(t *testing.T) {
 		"AllowSingleHosts",
 		"ExitNodeID",
 		"ExitNodeIP",
+		"InternalExitNodePrior",
 		"ExitNodeAllowLANAccess",
 		"CorpDNS",
 		"RunSSH",
@@ -61,9 +63,10 @@ func TestPrefsEqual(t *testing.T) {
 		"AppConnector",
 		"PostureChecking",
 		"NetfilterKind",
+		"DriveShares",
 		"Persist",
 	}
-	if have := fieldsOf(reflect.TypeOf(Prefs{})); !reflect.DeepEqual(have, prefsHandles) {
+	if have := fieldsOf(reflect.TypeFor[Prefs]()); !reflect.DeepEqual(have, prefsHandles) {
 		t.Errorf("Prefs.Equal check might be out of sync\nfields: %q\nhandled: %q\n",
 			have, prefsHandles)
 	}
@@ -294,18 +297,18 @@ func TestPrefsEqual(t *testing.T) {
 			false,
 		},
 		{
-			&Prefs{AutoUpdate: AutoUpdatePrefs{Check: true, Apply: false}},
-			&Prefs{AutoUpdate: AutoUpdatePrefs{Check: false, Apply: false}},
+			&Prefs{AutoUpdate: AutoUpdatePrefs{Check: true, Apply: opt.NewBool(false)}},
+			&Prefs{AutoUpdate: AutoUpdatePrefs{Check: false, Apply: opt.NewBool(false)}},
 			false,
 		},
 		{
-			&Prefs{AutoUpdate: AutoUpdatePrefs{Check: true, Apply: true}},
-			&Prefs{AutoUpdate: AutoUpdatePrefs{Check: true, Apply: false}},
+			&Prefs{AutoUpdate: AutoUpdatePrefs{Check: true, Apply: opt.NewBool(true)}},
+			&Prefs{AutoUpdate: AutoUpdatePrefs{Check: true, Apply: opt.NewBool(false)}},
 			false,
 		},
 		{
-			&Prefs{AutoUpdate: AutoUpdatePrefs{Check: true, Apply: false}},
-			&Prefs{AutoUpdate: AutoUpdatePrefs{Check: true, Apply: false}},
+			&Prefs{AutoUpdate: AutoUpdatePrefs{Check: true, Apply: opt.NewBool(false)}},
+			&Prefs{AutoUpdate: AutoUpdatePrefs{Check: true, Apply: opt.NewBool(false)}},
 			true,
 		},
 		{
@@ -522,7 +525,7 @@ func TestPrefsPretty(t *testing.T) {
 			Prefs{
 				AutoUpdate: AutoUpdatePrefs{
 					Check: true,
-					Apply: false,
+					Apply: opt.NewBool(false),
 				},
 			},
 			"linux",
@@ -532,7 +535,7 @@ func TestPrefsPretty(t *testing.T) {
 			Prefs{
 				AutoUpdate: AutoUpdatePrefs{
 					Check: true,
-					Apply: true,
+					Apply: opt.NewBool(true),
 				},
 			},
 			"linux",
@@ -612,16 +615,29 @@ func TestLoadPrefsFileWithZeroInIt(t *testing.T) {
 	t.Fatalf("unexpected prefs=%#v, err=%v", p, err)
 }
 
+func TestMaskedPrefsSetsInternal(t *testing.T) {
+	for _, f := range fieldsOf(reflect.TypeFor[MaskedPrefs]()) {
+		if !strings.HasSuffix(f, "Set") || !strings.HasPrefix(f, "Internal") {
+			continue
+		}
+		mp := new(MaskedPrefs)
+		reflect.ValueOf(mp).Elem().FieldByName(f).SetBool(true)
+		if !mp.SetsInternal() {
+			t.Errorf("MaskedPrefs.%sSet=true but SetsInternal=false", f)
+		}
+	}
+}
+
 func TestMaskedPrefsFields(t *testing.T) {
 	have := map[string]bool{}
-	for _, f := range fieldsOf(reflect.TypeOf(Prefs{})) {
+	for _, f := range fieldsOf(reflect.TypeFor[Prefs]()) {
 		if f == "Persist" {
 			// This one can't be edited.
 			continue
 		}
 		have[f] = true
 	}
-	for _, f := range fieldsOf(reflect.TypeOf(MaskedPrefs{})) {
+	for _, f := range fieldsOf(reflect.TypeFor[MaskedPrefs]()) {
 		if f == "Prefs" {
 			continue
 		}
@@ -643,9 +659,9 @@ func TestMaskedPrefsFields(t *testing.T) {
 
 	// And also make sure they line up in the right order, which
 	// ApplyEdits assumes.
-	pt := reflect.TypeOf(Prefs{})
-	mt := reflect.TypeOf(MaskedPrefs{})
-	for i := 0; i < mt.NumField(); i++ {
+	pt := reflect.TypeFor[Prefs]()
+	mt := reflect.TypeFor[MaskedPrefs]()
+	for i := range mt.NumField() {
 		name := mt.Field(i).Name
 		if i == 0 {
 			if name != "Prefs" {
@@ -764,7 +780,7 @@ func TestMaskedPrefsPretty(t *testing.T) {
 		{
 			m: &MaskedPrefs{
 				Prefs: Prefs{
-					AutoUpdate: AutoUpdatePrefs{Check: true, Apply: false},
+					AutoUpdate: AutoUpdatePrefs{Check: true, Apply: opt.NewBool(false)},
 				},
 				AutoUpdateSet: AutoUpdatePrefsMask{CheckSet: true, ApplySet: false},
 			},
@@ -773,7 +789,7 @@ func TestMaskedPrefsPretty(t *testing.T) {
 		{
 			m: &MaskedPrefs{
 				Prefs: Prefs{
-					AutoUpdate: AutoUpdatePrefs{Check: true, Apply: true},
+					AutoUpdate: AutoUpdatePrefs{Check: true, Apply: opt.NewBool(true)},
 				},
 				AutoUpdateSet: AutoUpdatePrefsMask{CheckSet: true, ApplySet: true},
 			},
@@ -782,7 +798,7 @@ func TestMaskedPrefsPretty(t *testing.T) {
 		{
 			m: &MaskedPrefs{
 				Prefs: Prefs{
-					AutoUpdate: AutoUpdatePrefs{Check: true, Apply: false},
+					AutoUpdate: AutoUpdatePrefs{Check: true, Apply: opt.NewBool(false)},
 				},
 				AutoUpdateSet: AutoUpdatePrefsMask{CheckSet: false, ApplySet: true},
 			},
@@ -791,7 +807,7 @@ func TestMaskedPrefsPretty(t *testing.T) {
 		{
 			m: &MaskedPrefs{
 				Prefs: Prefs{
-					AutoUpdate: AutoUpdatePrefs{Check: true, Apply: true},
+					AutoUpdate: AutoUpdatePrefs{Check: true, Apply: opt.NewBool(true)},
 				},
 				AutoUpdateSet: AutoUpdatePrefsMask{CheckSet: false, ApplySet: false},
 			},

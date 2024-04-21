@@ -1,6 +1,8 @@
 // Copyright (c) Tailscale Inc & AUTHORS
 // SPDX-License-Identifier: BSD-3-Clause
 
+//go:build !android
+
 package interfaces
 
 import (
@@ -45,14 +47,13 @@ Iface   Destination     Gateway         Flags   RefCnt  Use     Metric  Mask    
 ens18   00000000        0100000A        0003    0       0       0       00000000        0       0       0
 ens18   0000000A        00000000        0001    0       0       0       0000FFFF        0       0       0
 */
-func likelyHomeRouterIPLinux() (ret netip.Addr, ok bool) {
+func likelyHomeRouterIPLinux() (ret netip.Addr, myIP netip.Addr, ok bool) {
 	if procNetRouteErr.Load() {
 		// If we failed to read /proc/net/route previously, don't keep trying.
-		// But if we're on Android, go into the Android path.
 		if runtime.GOOS == "android" {
 			return likelyHomeRouterIPAndroid()
 		}
-		return ret, false
+		return ret, myIP, false
 	}
 	lineNum := 0
 	var f []mem.RO
@@ -99,7 +100,27 @@ func likelyHomeRouterIPLinux() (ret netip.Addr, ok bool) {
 		log.Printf("interfaces: failed to read /proc/net/route: %v", err)
 	}
 	if ret.IsValid() {
-		return ret, true
+		// Try to get the local IP of the interface associated with
+		// this route to short-circuit finding the IP associated with
+		// this gateway. This isn't fatal if it fails.
+		if len(f) > 0 && !disableLikelyHomeRouterIPSelf() {
+			ForeachInterface(func(ni Interface, pfxs []netip.Prefix) {
+				// Ensure this is the same interface
+				if !f[0].EqualString(ni.Name) {
+					return
+				}
+
+				// Find the first IPv4 address and use it.
+				for _, pfx := range pfxs {
+					if addr := pfx.Addr(); addr.Is4() {
+						myIP = addr
+						break
+					}
+				}
+			})
+		}
+
+		return ret, myIP, true
 	}
 	if lineNum >= maxProcNetRouteRead {
 		// If we went over our line limit without finding an answer, assume
@@ -113,12 +134,12 @@ func likelyHomeRouterIPLinux() (ret netip.Addr, ok bool) {
 		// find one in the future.
 		procNetRouteErr.Store(true)
 	}
-	return netip.Addr{}, false
+	return netip.Addr{}, netip.Addr{}, false
 }
 
 // Android apps don't have permission to read /proc/net/route, at
 // least on Google devices and the Android emulator.
-func likelyHomeRouterIPAndroid() (ret netip.Addr, ok bool) {
+func likelyHomeRouterIPAndroid() (ret netip.Addr, _ netip.Addr, ok bool) {
 	cmd := exec.Command("/system/bin/ip", "route", "show", "table", "0")
 	out, err := cmd.StdoutPipe()
 	if err != nil {
@@ -148,7 +169,7 @@ func likelyHomeRouterIPAndroid() (ret netip.Addr, ok bool) {
 	})
 	cmd.Process.Kill()
 	cmd.Wait()
-	return ret, ret.IsValid()
+	return ret, netip.Addr{}, ret.IsValid()
 }
 
 func defaultRoute() (d DefaultRouteDetails, err error) {
@@ -156,11 +177,6 @@ func defaultRoute() (d DefaultRouteDetails, err error) {
 	if err == nil {
 		d.InterfaceName = v
 		return d, nil
-	}
-	if runtime.GOOS == "android" {
-		v, err = defaultRouteInterfaceAndroidIPRoute()
-		d.InterfaceName = v
-		return d, err
 	}
 	// Issue 4038: the default route (such as on Unifi UDM Pro)
 	// might be in a non-default table, so it won't show up in
@@ -286,40 +302,4 @@ func defaultRouteInterfaceProcNet() (string, error) {
 		return defaultRouteInterfaceProcNetInternal(4096)
 	}
 	return rc, err
-}
-
-// defaultRouteInterfaceAndroidIPRoute tries to find the machine's default route interface name
-// by parsing the "ip route" command output. We use this on Android where /proc/net/route
-// can be missing entries or have locked-down permissions.
-// See also comments in https://github.com/tailscale/tailscale/pull/666.
-func defaultRouteInterfaceAndroidIPRoute() (ifname string, err error) {
-	cmd := exec.Command("/system/bin/ip", "route", "show", "table", "0")
-	out, err := cmd.StdoutPipe()
-	if err != nil {
-		return "", err
-	}
-	if err := cmd.Start(); err != nil {
-		log.Printf("interfaces: running /system/bin/ip: %v", err)
-		return "", err
-	}
-	// Search for line like "default via 10.0.2.2 dev radio0 table 1016 proto static mtu 1500 "
-	lineread.Reader(out, func(line []byte) error {
-		const pfx = "default via "
-		if !mem.HasPrefix(mem.B(line), mem.S(pfx)) {
-			return nil
-		}
-		ff := strings.Fields(string(line))
-		for i, v := range ff {
-			if i > 0 && ff[i-1] == "dev" && ifname == "" {
-				ifname = v
-			}
-		}
-		return nil
-	})
-	cmd.Process.Kill()
-	cmd.Wait()
-	if ifname == "" {
-		return "", errors.New("no default routes found")
-	}
-	return ifname, nil
 }

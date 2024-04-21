@@ -251,6 +251,29 @@ tailscale installed size:
 			out:     "",
 			wantErr: true,
 		},
+		{
+			desc: "multiple versions",
+			out: `
+tailscale-1.54.1-r0 description:
+The easiest, most secure way to use WireGuard and 2FA
+
+tailscale-1.54.1-r0 webpage:
+https://tailscale.com/
+
+tailscale-1.54.1-r0 installed size:
+34 MiB
+
+tailscale-1.58.2-r0 description:
+The easiest, most secure way to use WireGuard and 2FA
+
+tailscale-1.58.2-r0 webpage:
+https://tailscale.com/
+
+tailscale-1.58.2-r0 installed size:
+35 MiB
+`,
+			want: "1.58.2",
+		},
 	}
 
 	for _, tt := range tests {
@@ -640,7 +663,7 @@ func genTarball(t *testing.T, path string, files map[string]string) {
 
 func TestWriteFileOverwrite(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "test")
-	for i := 0; i < 2; i++ {
+	for i := range 2 {
 		content := fmt.Sprintf("content %d", i)
 		if err := writeFile(strings.NewReader(content), path, 0600); err != nil {
 			t.Fatal(err)

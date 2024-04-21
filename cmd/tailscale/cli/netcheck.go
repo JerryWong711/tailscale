@@ -28,7 +28,7 @@ import (
 
 var netcheckCmd = &ffcli.Command{
 	Name:       "netcheck",
-	ShortUsage: "netcheck",
+	ShortUsage: "tailscale netcheck",
 	ShortHelp:  "Print an analysis of local network conditions",
 	Exec:       runNetcheck,
 	FlagSet: (func() *flag.FlagSet {
@@ -85,7 +85,7 @@ func runNetcheck(ctx context.Context, args []string) error {
 	}
 	for {
 		t0 := time.Now()
-		report, err := c.GetReport(ctx, dm)
+		report, err := c.GetReport(ctx, dm, nil)
 		d := time.Since(t0)
 		if netcheckArgs.verbose {
 			c.Logf("GetReport took %v; err=%v", d.Round(time.Millisecond), err)

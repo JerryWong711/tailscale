@@ -29,6 +29,7 @@ import (
 	"tailscale.com/types/ptr"
 	"tailscale.com/util/deephash/testtype"
 	"tailscale.com/util/dnsname"
+	"tailscale.com/util/hashx"
 	"tailscale.com/version"
 	"tailscale.com/wgengine/filter"
 	"tailscale.com/wgengine/router"
@@ -39,6 +40,22 @@ type appendBytes []byte
 
 func (p appendBytes) AppendTo(b []byte) []byte {
 	return append(b, p...)
+}
+
+type selfHasherValueRecv struct {
+	emit uint64
+}
+
+func (s selfHasherValueRecv) Hash(h *hashx.Block512) {
+	h.HashUint64(s.emit)
+}
+
+type selfHasherPointerRecv struct {
+	emit uint64
+}
+
+func (s *selfHasherPointerRecv) Hash(h *hashx.Block512) {
+	h.HashUint64(s.emit)
 }
 
 func TestHash(t *testing.T) {
@@ -139,13 +156,7 @@ func TestHash(t *testing.T) {
 		{in: tuple{netip.AddrPortFrom(netip.AddrFrom4([4]byte{192, 168, 0, 1}), 1234), netip.AddrPortFrom(netip.AddrFrom4([4]byte{192, 168, 0, 1}), 1235)}, wantEq: false},
 		{in: tuple{netip.AddrPortFrom(netip.AddrFrom4([4]byte{192, 168, 0, 1}), 1234), netip.AddrPortFrom(netip.AddrFrom4([4]byte{192, 168, 0, 2}), 1234)}, wantEq: false},
 		{in: tuple{netip.Prefix{}, netip.Prefix{}}, wantEq: true},
-
-		// In go1.21 PrefixFrom will now return a zero value Prefix if the
-		// provided Addr is unspecified. This is a change from previous
-		// behavior, so we disable this test for now.
-		// TODO(#8419): renable after go1.21 is released.
-		// {in: tuple{netip.Prefix{}, netip.PrefixFrom(netip.Addr{}, 1)}, wantEq: true},
-
+		{in: tuple{netip.Prefix{}, netip.PrefixFrom(netip.Addr{}, 1)}, wantEq: true},
 		{in: tuple{netip.Prefix{}, netip.PrefixFrom(netip.AddrFrom4([4]byte{}), 0)}, wantEq: false},
 		{in: tuple{netip.PrefixFrom(netip.AddrFrom4([4]byte{}), 1), netip.PrefixFrom(netip.AddrFrom4([4]byte{}), 1)}, wantEq: true},
 		{in: tuple{netip.PrefixFrom(netip.AddrFrom4([4]byte{192, 168, 0, 1}), 1), netip.PrefixFrom(netip.AddrFrom4([4]byte{192, 168, 0, 1}), 1)}, wantEq: true},
@@ -169,6 +180,12 @@ func TestHash(t *testing.T) {
 			b[0] = 1
 			return b
 		}()))}, wantEq: false},
+		{in: tuple{&selfHasherPointerRecv{}, &selfHasherPointerRecv{}}, wantEq: true},
+		{in: tuple{(*selfHasherPointerRecv)(nil), (*selfHasherPointerRecv)(nil)}, wantEq: true},
+		{in: tuple{(*selfHasherPointerRecv)(nil), &selfHasherPointerRecv{}}, wantEq: false},
+		{in: tuple{&selfHasherPointerRecv{emit: 1}, &selfHasherPointerRecv{emit: 2}}, wantEq: false},
+		{in: tuple{selfHasherValueRecv{emit: 1}, selfHasherValueRecv{emit: 2}}, wantEq: false},
+		{in: tuple{selfHasherValueRecv{emit: 2}, selfHasherValueRecv{emit: 2}}, wantEq: true},
 	}
 
 	for _, tt := range tests {
@@ -185,7 +202,7 @@ func TestDeepHash(t *testing.T) {
 	v := getVal()
 	hash1 := Hash(v)
 	t.Logf("hash: %v", hash1)
-	for i := 0; i < 20; i++ {
+	for range 20 {
 		v := getVal()
 		hash2 := Hash(v)
 		if hash1 != hash2 {
@@ -342,11 +359,11 @@ func getVal() *tailscaleTypes {
 }
 
 type IntThenByte struct {
-	i int
-	b byte
+	_ int
+	_ byte
 }
 
-type TwoInts struct{ a, b int }
+type TwoInts struct{ _, _ int }
 
 type IntIntByteInt struct {
 	i1, i2 int32
@@ -355,7 +372,6 @@ type IntIntByteInt struct {
 }
 
 func u8(n uint8) string   { return string([]byte{n}) }
-func u16(n uint16) string { return string(binary.LittleEndian.AppendUint16(nil, n)) }
 func u32(n uint32) string { return string(binary.LittleEndian.AppendUint32(nil, n)) }
 func u64(n uint64) string { return string(binary.LittleEndian.AppendUint64(nil, n)) }
 func ux(n uint) string {
@@ -744,7 +760,7 @@ var sink Sum
 func BenchmarkHash(b *testing.B) {
 	b.ReportAllocs()
 	v := getVal()
-	for i := 0; i < b.N; i++ {
+	for range b.N {
 		sink = Hash(v)
 	}
 }
@@ -793,22 +809,22 @@ var filterRules = []tailcfg.FilterRule{
 func BenchmarkHashPacketFilter(b *testing.B) {
 	b.ReportAllocs()
 
-	for i := 0; i < b.N; i++ {
+	for range b.N {
 		sink = Hash(&filterRules)
 	}
 }
 
 func TestHashMapAcyclic(t *testing.T) {
 	m := map[int]string{}
-	for i := 0; i < 100; i++ {
+	for i := range 100 {
 		m[i] = fmt.Sprint(i)
 	}
 	got := map[string]bool{}
 
 	hb := &hashBuffer{Hash: sha256.New()}
 
-	hash := lookupTypeHasher(reflect.TypeOf(m))
-	for i := 0; i < 20; i++ {
+	hash := lookupTypeHasher(reflect.TypeFor[map[int]string]())
+	for range 20 {
 		va := reflect.ValueOf(&m).Elem()
 		hb.Reset()
 		h := new(hasher)
@@ -846,7 +862,7 @@ func TestPrintArray(t *testing.T) {
 func BenchmarkHashMapAcyclic(b *testing.B) {
 	b.ReportAllocs()
 	m := map[int]string{}
-	for i := 0; i < 100; i++ {
+	for i := range 100 {
 		m[i] = fmt.Sprint(i)
 	}
 
@@ -857,7 +873,7 @@ func BenchmarkHashMapAcyclic(b *testing.B) {
 	h := new(hasher)
 	h.Block512.Hash = hb
 
-	for i := 0; i < b.N; i++ {
+	for range b.N {
 		h.Reset()
 		hash(h, pointerOf(va.Addr()))
 	}
@@ -867,14 +883,14 @@ func BenchmarkTailcfgNode(b *testing.B) {
 	b.ReportAllocs()
 
 	node := new(tailcfg.Node)
-	for i := 0; i < b.N; i++ {
+	for range b.N {
 		sink = Hash(node)
 	}
 }
 
 func TestExhaustive(t *testing.T) {
 	seen := make(map[Sum]bool)
-	for i := 0; i < 100000; i++ {
+	for i := range 100000 {
 		s := Hash(&i)
 		if seen[s] {
 			t.Fatalf("hash collision %v", i)
@@ -955,7 +971,7 @@ func BenchmarkHashArray(b *testing.B) {
 	}
 	x := &T{X: [32]byte{1: 1, 2: 2, 3: 3, 4: 4}}
 
-	for i := 0; i < b.N; i++ {
+	for range b.N {
 		sink = Hash(x)
 	}
 }
@@ -1118,7 +1134,7 @@ func BenchmarkAppendTo(b *testing.B) {
 
 	hashBuf := make([]byte, 0, 100)
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for range b.N {
 		hashBuf = h.AppendTo(hashBuf[:0])
 	}
 }

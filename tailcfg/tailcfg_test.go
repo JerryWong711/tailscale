@@ -4,7 +4,6 @@
 package tailcfg_test
 
 import (
-	"encoding"
 	"encoding/json"
 	"net/netip"
 	"os"
@@ -16,6 +15,7 @@ import (
 	"time"
 
 	. "tailscale.com/tailcfg"
+	"tailscale.com/tstest/deptest"
 	"tailscale.com/types/key"
 	"tailscale.com/types/opt"
 	"tailscale.com/types/ptr"
@@ -23,7 +23,7 @@ import (
 )
 
 func fieldsOf(t reflect.Type) (fields []string) {
-	for i := 0; i < t.NumField(); i++ {
+	for i := range t.NumField() {
 		fields = append(fields, t.Field(i).Name)
 	}
 	return
@@ -68,7 +68,7 @@ func TestHostinfoEqual(t *testing.T) {
 		"AppConnector",
 		"Location",
 	}
-	if have := fieldsOf(reflect.TypeOf(Hostinfo{})); !reflect.DeepEqual(have, hiHandles) {
+	if have := fieldsOf(reflect.TypeFor[Hostinfo]()); !reflect.DeepEqual(have, hiHandles) {
 		t.Errorf("Hostinfo.Equal check might be out of sync\nfields: %q\nhandled: %q\n",
 			have, hiHandles)
 	}
@@ -365,7 +365,7 @@ func TestNodeEqual(t *testing.T) {
 		"DataPlaneAuditLogID", "Expired", "SelfNodeV4MasqAddrForThisPeer",
 		"SelfNodeV6MasqAddrForThisPeer", "IsWireGuardOnly", "ExitNodeDNSResolvers",
 	}
-	if have := fieldsOf(reflect.TypeOf(Node{})); !reflect.DeepEqual(have, nodeHandles) {
+	if have := fieldsOf(reflect.TypeFor[Node]()); !reflect.DeepEqual(have, nodeHandles) {
 		t.Errorf("Node.Equal check might be out of sync\nfields: %q\nhandled: %q\n",
 			have, nodeHandles)
 	}
@@ -633,33 +633,9 @@ func TestNetInfoFields(t *testing.T) {
 		"DERPLatency",
 		"FirewallMode",
 	}
-	if have := fieldsOf(reflect.TypeOf(NetInfo{})); !reflect.DeepEqual(have, handled) {
+	if have := fieldsOf(reflect.TypeFor[NetInfo]()); !reflect.DeepEqual(have, handled) {
 		t.Errorf("NetInfo.Clone/BasicallyEqually check might be out of sync\nfields: %q\nhandled: %q\n",
 			have, handled)
-	}
-}
-
-type keyIn interface {
-	String() string
-	MarshalText() ([]byte, error)
-}
-
-func testKey(t *testing.T, prefix string, in keyIn, out encoding.TextUnmarshaler) {
-	got, err := in.MarshalText()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := out.UnmarshalText(got); err != nil {
-		t.Fatal(err)
-	}
-	if s := in.String(); string(got) != s {
-		t.Errorf("MarshalText = %q != String %q", got, s)
-	}
-	if !strings.HasPrefix(string(got), prefix) {
-		t.Errorf("%q didn't start with prefix %q", got, prefix)
-	}
-	if reflect.ValueOf(out).Elem().Interface() != in {
-		t.Errorf("mismatch after unmarshal")
 	}
 }
 
@@ -866,4 +842,15 @@ func TestRawMessage(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestDeps(t *testing.T) {
+	deptest.DepChecker{
+		BadDeps: map[string]string{
+			// Make sure we don't again accidentally bring in a dependency on
+			// drive or its transitive dependencies
+			"tailscale.com/drive/driveimpl":  "https://github.com/tailscale/tailscale/pull/10631",
+			"github.com/studio-b12/gowebdav": "https://github.com/tailscale/tailscale/pull/10631",
+		},
+	}.Check(t)
 }

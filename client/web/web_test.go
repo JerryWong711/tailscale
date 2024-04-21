@@ -4,6 +4,7 @@
 package web
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -86,75 +87,172 @@ func TestQnapAuthnURL(t *testing.T) {
 
 // TestServeAPI tests the web client api's handling of
 //  1. invalid endpoint errors
-//  2. localapi proxy allowlist
+//  2. permissioning of api endpoints based on node capabilities
 func TestServeAPI(t *testing.T) {
+	selfTags := views.SliceOf([]string{"tag:server"})
+	self := &ipnstate.PeerStatus{ID: "self", Tags: &selfTags}
+	prefs := &ipn.Prefs{}
+
+	remoteUser := &tailcfg.UserProfile{ID: tailcfg.UserID(1)}
+	remoteIPWithAllCapabilities := "100.100.100.101"
+	remoteIPWithNoCapabilities := "100.100.100.102"
+
 	lal := memnet.Listen("local-tailscaled.sock:80")
 	defer lal.Close()
-	// Serve dummy localapi. Just returns "success".
-	localapi := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprintf(w, "success")
-	})}
+	localapi := mockLocalAPI(t,
+		map[string]*apitype.WhoIsResponse{
+			remoteIPWithAllCapabilities: {
+				Node:        &tailcfg.Node{StableID: "node1"},
+				UserProfile: remoteUser,
+				CapMap:      tailcfg.PeerCapMap{tailcfg.PeerCapabilityWebUI: []tailcfg.RawMessage{"{\"canEdit\":[\"*\"]}"}},
+			},
+			remoteIPWithNoCapabilities: {
+				Node:        &tailcfg.Node{StableID: "node2"},
+				UserProfile: remoteUser,
+			},
+		},
+		func() *ipnstate.PeerStatus { return self },
+		func() *ipn.Prefs { return prefs },
+		nil,
+	)
 	defer localapi.Close()
-
 	go localapi.Serve(lal)
-	s := &Server{lc: &tailscale.LocalClient{Dial: lal.Dial}}
+
+	s := &Server{
+		mode:    ManageServerMode,
+		lc:      &tailscale.LocalClient{Dial: lal.Dial},
+		timeNow: time.Now,
+	}
+
+	type requestTest struct {
+		remoteIP     string
+		wantResponse string
+		wantStatus   int
+	}
 
 	tests := []struct {
-		name           string
-		reqMethod      string
 		reqPath        string
+		reqMethod      string
 		reqContentType string
-		wantResp       string
-		wantStatus     int
+		reqBody        string
+		tests          []requestTest
 	}{{
-		name:       "invalid_endpoint",
-		reqMethod:  httpm.POST,
-		reqPath:    "/not-an-endpoint",
-		wantResp:   "invalid endpoint",
-		wantStatus: http.StatusNotFound,
+		reqPath:   "/not-an-endpoint",
+		reqMethod: httpm.POST,
+		tests: []requestTest{{
+			remoteIP:     remoteIPWithNoCapabilities,
+			wantResponse: "invalid endpoint",
+			wantStatus:   http.StatusNotFound,
+		}, {
+			remoteIP:     remoteIPWithAllCapabilities,
+			wantResponse: "invalid endpoint",
+			wantStatus:   http.StatusNotFound,
+		}},
 	}, {
-		name:       "not_in_localapi_allowlist",
-		reqMethod:  httpm.POST,
-		reqPath:    "/local/v0/not-allowlisted",
-		wantResp:   "/v0/not-allowlisted not allowed from localapi proxy",
-		wantStatus: http.StatusForbidden,
+		reqPath:   "/local/v0/not-an-endpoint",
+		reqMethod: httpm.POST,
+		tests: []requestTest{{
+			remoteIP:     remoteIPWithNoCapabilities,
+			wantResponse: "invalid endpoint",
+			wantStatus:   http.StatusNotFound,
+		}, {
+			remoteIP:     remoteIPWithAllCapabilities,
+			wantResponse: "invalid endpoint",
+			wantStatus:   http.StatusNotFound,
+		}},
 	}, {
-		name:       "in_localapi_allowlist",
-		reqMethod:  httpm.POST,
-		reqPath:    "/local/v0/logout",
-		wantResp:   "success", // Successfully allowed to hit localapi.
-		wantStatus: http.StatusOK,
+		reqPath:   "/local/v0/logout",
+		reqMethod: httpm.POST,
+		tests: []requestTest{{
+			remoteIP:     remoteIPWithNoCapabilities,
+			wantResponse: "not allowed", // requesting node has insufficient permissions
+			wantStatus:   http.StatusUnauthorized,
+		}, {
+			remoteIP:     remoteIPWithAllCapabilities,
+			wantResponse: "success", // requesting node has sufficient permissions
+			wantStatus:   http.StatusOK,
+		}},
 	}, {
-		name:           "patch_bad_contenttype",
-		reqMethod:      httpm.PATCH,
+		reqPath:   "/exit-nodes",
+		reqMethod: httpm.GET,
+		tests: []requestTest{{
+			remoteIP:     remoteIPWithNoCapabilities,
+			wantResponse: "null",
+			wantStatus:   http.StatusOK, // allowed, no additional capabilities required
+		}, {
+			remoteIP:     remoteIPWithAllCapabilities,
+			wantResponse: "null",
+			wantStatus:   http.StatusOK,
+		}},
+	}, {
+		reqPath:   "/routes",
+		reqMethod: httpm.POST,
+		reqBody:   "{\"setExitNode\":true}",
+		tests: []requestTest{{
+			remoteIP:     remoteIPWithNoCapabilities,
+			wantResponse: "not allowed",
+			wantStatus:   http.StatusUnauthorized,
+		}, {
+			remoteIP:   remoteIPWithAllCapabilities,
+			wantStatus: http.StatusOK,
+		}},
+	}, {
 		reqPath:        "/local/v0/prefs",
+		reqMethod:      httpm.PATCH,
+		reqBody:        "{\"runSSHSet\":true}",
+		reqContentType: "application/json",
+		tests: []requestTest{{
+			remoteIP:     remoteIPWithNoCapabilities,
+			wantResponse: "not allowed",
+			wantStatus:   http.StatusUnauthorized,
+		}, {
+			remoteIP:   remoteIPWithAllCapabilities,
+			wantStatus: http.StatusOK,
+		}},
+	}, {
+		reqPath:        "/local/v0/prefs",
+		reqMethod:      httpm.PATCH,
 		reqContentType: "multipart/form-data",
-		wantResp:       "invalid request",
-		wantStatus:     http.StatusBadRequest,
+		tests: []requestTest{{
+			remoteIP:     remoteIPWithNoCapabilities,
+			wantResponse: "invalid request",
+			wantStatus:   http.StatusBadRequest,
+		}, {
+			remoteIP:     remoteIPWithAllCapabilities,
+			wantResponse: "invalid request",
+			wantStatus:   http.StatusBadRequest,
+		}},
 	}}
 	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			r := httptest.NewRequest(tt.reqMethod, "/api"+tt.reqPath, nil)
-			if tt.reqContentType != "" {
-				r.Header.Add("Content-Type", tt.reqContentType)
-			}
-			w := httptest.NewRecorder()
+		for _, req := range tt.tests {
+			t.Run(req.remoteIP+"_requesting_"+tt.reqPath, func(t *testing.T) {
+				var reqBody io.Reader
+				if tt.reqBody != "" {
+					reqBody = bytes.NewBuffer([]byte(tt.reqBody))
+				}
+				r := httptest.NewRequest(tt.reqMethod, "/api"+tt.reqPath, reqBody)
+				r.RemoteAddr = req.remoteIP
+				if tt.reqContentType != "" {
+					r.Header.Add("Content-Type", tt.reqContentType)
+				}
+				w := httptest.NewRecorder()
 
-			s.serveAPI(w, r)
-			res := w.Result()
-			defer res.Body.Close()
-			if gotStatus := res.StatusCode; tt.wantStatus != gotStatus {
-				t.Errorf("wrong status; want=%v, got=%v", tt.wantStatus, gotStatus)
-			}
-			body, err := io.ReadAll(res.Body)
-			if err != nil {
-				t.Fatal(err)
-			}
-			gotResp := strings.TrimSuffix(string(body), "\n") // trim trailing newline
-			if tt.wantResp != gotResp {
-				t.Errorf("wrong response; want=%q, got=%q", tt.wantResp, gotResp)
-			}
-		})
+				s.serveAPI(w, r)
+				res := w.Result()
+				defer res.Body.Close()
+				if gotStatus := res.StatusCode; req.wantStatus != gotStatus {
+					t.Errorf("wrong status; want=%v, got=%v", req.wantStatus, gotStatus)
+				}
+				body, err := io.ReadAll(res.Body)
+				if err != nil {
+					t.Fatal(err)
+				}
+				gotResp := strings.TrimSuffix(string(body), "\n") // trim trailing newline
+				if req.wantResponse != gotResp {
+					t.Errorf("wrong response; want=%q, got=%q", req.wantResponse, gotResp)
+				}
+			})
+		}
 	}
 }
 
@@ -450,6 +548,7 @@ func TestServeAuth(t *testing.T) {
 		NodeName:      remoteNode.Node.Name,
 		NodeIP:        remoteIP,
 		ProfilePicURL: user.ProfilePicURL,
+		Capabilities:  peerCapabilities{capFeatureAll: true},
 	}
 
 	testControlURL := &defaultControlURL
@@ -523,7 +622,7 @@ func TestServeAuth(t *testing.T) {
 			name:          "no-session",
 			path:          "/api/auth",
 			wantStatus:    http.StatusOK,
-			wantResp:      &authResponse{AuthNeeded: tailscaleAuth, ViewerIdentity: vi},
+			wantResp:      &authResponse{ViewerIdentity: vi, ServerMode: ManageServerMode},
 			wantNewCookie: false,
 			wantSession:   nil,
 		},
@@ -548,7 +647,7 @@ func TestServeAuth(t *testing.T) {
 			path:       "/api/auth",
 			cookie:     successCookie,
 			wantStatus: http.StatusOK,
-			wantResp:   &authResponse{AuthNeeded: tailscaleAuth, ViewerIdentity: vi},
+			wantResp:   &authResponse{ViewerIdentity: vi, ServerMode: ManageServerMode},
 			wantSession: &browserSession{
 				ID:            successCookie,
 				SrcNode:       remoteNode.Node.ID,
@@ -596,7 +695,7 @@ func TestServeAuth(t *testing.T) {
 			path:       "/api/auth",
 			cookie:     successCookie,
 			wantStatus: http.StatusOK,
-			wantResp:   &authResponse{CanManageNode: true, ViewerIdentity: vi},
+			wantResp:   &authResponse{Authorized: true, ViewerIdentity: vi, ServerMode: ManageServerMode},
 			wantSession: &browserSession{
 				ID:            successCookie,
 				SrcNode:       remoteNode.Node.ID,
@@ -790,6 +889,7 @@ func TestServeAPIAuthMetricLogging(t *testing.T) {
 		},
 		UserProfile: otherUser,
 	}
+	nonTailscaleIP := "10.100.2.3"
 
 	testControlURL := &defaultControlURL
 	var loggedMetrics []string
@@ -820,9 +920,9 @@ func TestServeAPIAuthMetricLogging(t *testing.T) {
 		waitAuthURL: mockWaitAuthURL,
 	}
 
-	remoteNodeCookie := "ts-cookie-remote-node"
-	s.browserSessions.Store(remoteNodeCookie, &browserSession{
-		ID:            remoteNodeCookie,
+	authenticatedRemoteNodeCookie := "ts-cookie-remote-node-authenticated"
+	s.browserSessions.Store(authenticatedRemoteNodeCookie, &browserSession{
+		ID:            authenticatedRemoteNodeCookie,
 		SrcNode:       remoteNode.Node.ID,
 		SrcUser:       user.ID,
 		Created:       oneHourAgo,
@@ -830,15 +930,35 @@ func TestServeAPIAuthMetricLogging(t *testing.T) {
 		AuthURL:       *testControlURL + testAuthPathSuccess,
 		Authenticated: true,
 	})
-	localNodeCookie := "ts-cookie-local-node"
-	s.browserSessions.Store(localNodeCookie, &browserSession{
-		ID:            localNodeCookie,
+	authenticatedLocalNodeCookie := "ts-cookie-local-node-authenticated"
+	s.browserSessions.Store(authenticatedLocalNodeCookie, &browserSession{
+		ID:            authenticatedLocalNodeCookie,
 		SrcNode:       localNode.Node.ID,
 		SrcUser:       user.ID,
 		Created:       oneHourAgo,
 		AuthID:        testAuthPathSuccess,
 		AuthURL:       *testControlURL + testAuthPathSuccess,
 		Authenticated: true,
+	})
+	unauthenticatedRemoteNodeCookie := "ts-cookie-remote-node-unauthenticated"
+	s.browserSessions.Store(unauthenticatedRemoteNodeCookie, &browserSession{
+		ID:            unauthenticatedRemoteNodeCookie,
+		SrcNode:       remoteNode.Node.ID,
+		SrcUser:       user.ID,
+		Created:       oneHourAgo,
+		AuthID:        testAuthPathSuccess,
+		AuthURL:       *testControlURL + testAuthPathSuccess,
+		Authenticated: false,
+	})
+	unauthenticatedLocalNodeCookie := "ts-cookie-local-node-unauthenticated"
+	s.browserSessions.Store(unauthenticatedLocalNodeCookie, &browserSession{
+		ID:            unauthenticatedLocalNodeCookie,
+		SrcNode:       localNode.Node.ID,
+		SrcUser:       user.ID,
+		Created:       oneHourAgo,
+		AuthID:        testAuthPathSuccess,
+		AuthURL:       *testControlURL + testAuthPathSuccess,
+		Authenticated: false,
 	})
 
 	tests := []struct {
@@ -850,33 +970,51 @@ func TestServeAPIAuthMetricLogging(t *testing.T) {
 	}{
 		{
 			name:             "managing-remote",
-			cookie:           remoteNodeCookie,
+			cookie:           authenticatedRemoteNodeCookie,
 			remoteAddr:       remoteIP,
 			wantLoggedMetric: "web_client_managing_remote",
 		},
 		{
 			name:             "managing-local",
-			cookie:           localNodeCookie,
+			cookie:           authenticatedLocalNodeCookie,
 			remoteAddr:       localIP,
 			wantLoggedMetric: "web_client_managing_local",
 		},
 		{
 			name:             "viewing-not-owner",
-			cookie:           remoteNodeCookie,
+			cookie:           authenticatedRemoteNodeCookie,
 			remoteAddr:       otherIP,
 			wantLoggedMetric: "web_client_viewing_not_owner",
 		},
 		{
 			name:             "viewing-local-tagged",
-			cookie:           localNodeCookie,
+			cookie:           authenticatedLocalNodeCookie,
 			remoteAddr:       localTaggedIP,
 			wantLoggedMetric: "web_client_viewing_local_tag",
 		},
 		{
 			name:             "viewing-remote-tagged",
-			cookie:           remoteNodeCookie,
+			cookie:           authenticatedRemoteNodeCookie,
 			remoteAddr:       remoteTaggedIP,
 			wantLoggedMetric: "web_client_viewing_remote_tag",
+		},
+		{
+			name:             "viewing-local-non-tailscale",
+			cookie:           authenticatedLocalNodeCookie,
+			remoteAddr:       nonTailscaleIP,
+			wantLoggedMetric: "web_client_viewing_local",
+		},
+		{
+			name:             "viewing-local-unauthenticated",
+			cookie:           unauthenticatedLocalNodeCookie,
+			remoteAddr:       localIP,
+			wantLoggedMetric: "web_client_viewing_local",
+		},
+		{
+			name:             "viewing-remote-unauthenticated",
+			cookie:           unauthenticatedRemoteNodeCookie,
+			remoteAddr:       remoteIP,
+			wantLoggedMetric: "web_client_viewing_remote",
 		},
 	}
 	for _, tt := range tests {
@@ -896,6 +1034,78 @@ func TestServeAPIAuthMetricLogging(t *testing.T) {
 
 			res := w.Result()
 			defer res.Body.Close()
+		})
+	}
+}
+
+// TestPathPrefix tests that the provided path prefix is normalized correctly.
+// If a leading '/' is missing, one should be added.
+// If multiple leading '/' are present, they should be collapsed to one.
+// Additionally verify that this prevents open redirects when enforcing the path prefix.
+func TestPathPrefix(t *testing.T) {
+	tests := []struct {
+		name         string
+		prefix       string
+		wantPrefix   string
+		wantLocation string
+	}{
+		{
+			name:         "no-leading-slash",
+			prefix:       "javascript:alert(1)",
+			wantPrefix:   "/javascript:alert(1)",
+			wantLocation: "/javascript:alert(1)/",
+		},
+		{
+			name:   "2-slashes",
+			prefix: "//evil.example.com/goat",
+			// We must also get the trailing slash added:
+			wantPrefix:   "/evil.example.com/goat",
+			wantLocation: "/evil.example.com/goat/",
+		},
+		{
+			name:   "absolute-url",
+			prefix: "http://evil.example.com",
+			// We must also get the trailing slash added:
+			wantPrefix:   "/http:/evil.example.com",
+			wantLocation: "/http:/evil.example.com/",
+		},
+		{
+			name:   "double-dot",
+			prefix: "/../.././etc/passwd",
+			// We must also get the trailing slash added:
+			wantPrefix:   "/etc/passwd",
+			wantLocation: "/etc/passwd/",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			options := ServerOpts{
+				Mode:       LoginServerMode,
+				PathPrefix: tt.prefix,
+				CGIMode:    true,
+			}
+			s, err := NewServer(options)
+			if err != nil {
+				t.Error(err)
+			}
+
+			// verify provided prefix was normalized correctly
+			if s.pathPrefix != tt.wantPrefix {
+				t.Errorf("prefix was not normalized correctly; want=%q, got=%q", tt.wantPrefix, s.pathPrefix)
+			}
+
+			s.logf = t.Logf
+			r := httptest.NewRequest(httpm.GET, "http://localhost/", nil)
+			w := httptest.NewRecorder()
+			s.ServeHTTP(w, r)
+			res := w.Result()
+			defer res.Body.Close()
+
+			location := w.Header().Get("Location")
+			if location != tt.wantLocation {
+				t.Errorf("request got wrong location; want=%q, got=%q", tt.wantLocation, location)
+			}
 		})
 	}
 }
@@ -968,7 +1178,7 @@ func TestRequireTailscaleIP(t *testing.T) {
 	}
 
 	for _, tt := range tests {
-		t.Run(tt.target, func(t *testing.T) {
+		t.Run(tt.name, func(t *testing.T) {
 			s.logf = t.Logf
 			r := httptest.NewRequest(httpm.GET, tt.target, nil)
 			w := httptest.NewRecorder()
@@ -981,6 +1191,217 @@ func TestRequireTailscaleIP(t *testing.T) {
 			location := w.Header().Get("Location")
 			if location != tt.wantLocation {
 				t.Errorf("request(%q) wrong location; want=%q, got=%q", tt.target, tt.wantLocation, location)
+			}
+		})
+	}
+}
+
+func TestPeerCapabilities(t *testing.T) {
+	userOwnedStatus := &ipnstate.Status{Self: &ipnstate.PeerStatus{UserID: tailcfg.UserID(1)}}
+	tags := views.SliceOf[string]([]string{"tag:server"})
+	tagOwnedStatus := &ipnstate.Status{Self: &ipnstate.PeerStatus{Tags: &tags}}
+
+	// Testing web.toPeerCapabilities
+	toPeerCapsTests := []struct {
+		name     string
+		status   *ipnstate.Status
+		whois    *apitype.WhoIsResponse
+		wantCaps peerCapabilities
+	}{
+		{
+			name:     "empty-whois",
+			status:   userOwnedStatus,
+			whois:    nil,
+			wantCaps: peerCapabilities{},
+		},
+		{
+			name:   "user-owned-node-non-owner-caps-ignored",
+			status: userOwnedStatus,
+			whois: &apitype.WhoIsResponse{
+				UserProfile: &tailcfg.UserProfile{ID: tailcfg.UserID(2)},
+				Node:        &tailcfg.Node{ID: tailcfg.NodeID(1)},
+				CapMap: tailcfg.PeerCapMap{
+					tailcfg.PeerCapabilityWebUI: []tailcfg.RawMessage{
+						"{\"canEdit\":[\"ssh\",\"subnets\"]}",
+					},
+				},
+			},
+			wantCaps: peerCapabilities{},
+		},
+		{
+			name:   "user-owned-node-owner-caps-ignored",
+			status: userOwnedStatus,
+			whois: &apitype.WhoIsResponse{
+				UserProfile: &tailcfg.UserProfile{ID: tailcfg.UserID(1)},
+				Node:        &tailcfg.Node{ID: tailcfg.NodeID(1)},
+				CapMap: tailcfg.PeerCapMap{
+					tailcfg.PeerCapabilityWebUI: []tailcfg.RawMessage{
+						"{\"canEdit\":[\"ssh\",\"subnets\"]}",
+					},
+				},
+			},
+			wantCaps: peerCapabilities{capFeatureAll: true}, // should just have wildcard
+		},
+		{
+			name:   "tag-owned-no-webui-caps",
+			status: tagOwnedStatus,
+			whois: &apitype.WhoIsResponse{
+				Node: &tailcfg.Node{ID: tailcfg.NodeID(1)},
+				CapMap: tailcfg.PeerCapMap{
+					tailcfg.PeerCapabilityDebugPeer: []tailcfg.RawMessage{},
+				},
+			},
+			wantCaps: peerCapabilities{},
+		},
+		{
+			name:   "tag-owned-one-webui-cap",
+			status: tagOwnedStatus,
+			whois: &apitype.WhoIsResponse{
+				Node: &tailcfg.Node{ID: tailcfg.NodeID(1)},
+				CapMap: tailcfg.PeerCapMap{
+					tailcfg.PeerCapabilityWebUI: []tailcfg.RawMessage{
+						"{\"canEdit\":[\"ssh\",\"subnets\"]}",
+					},
+				},
+			},
+			wantCaps: peerCapabilities{
+				capFeatureSSH:     true,
+				capFeatureSubnets: true,
+			},
+		},
+		{
+			name:   "tag-owned-multiple-webui-cap",
+			status: tagOwnedStatus,
+			whois: &apitype.WhoIsResponse{
+				Node: &tailcfg.Node{ID: tailcfg.NodeID(1)},
+				CapMap: tailcfg.PeerCapMap{
+					tailcfg.PeerCapabilityWebUI: []tailcfg.RawMessage{
+						"{\"canEdit\":[\"ssh\",\"subnets\"]}",
+						"{\"canEdit\":[\"subnets\",\"exitnodes\",\"*\"]}",
+					},
+				},
+			},
+			wantCaps: peerCapabilities{
+				capFeatureSSH:       true,
+				capFeatureSubnets:   true,
+				capFeatureExitNodes: true,
+				capFeatureAll:       true,
+			},
+		},
+		{
+			name:   "tag-owned-case-insensitive-caps",
+			status: tagOwnedStatus,
+			whois: &apitype.WhoIsResponse{
+				Node: &tailcfg.Node{ID: tailcfg.NodeID(1)},
+				CapMap: tailcfg.PeerCapMap{
+					tailcfg.PeerCapabilityWebUI: []tailcfg.RawMessage{
+						"{\"canEdit\":[\"SSH\",\"sUBnets\"]}",
+					},
+				},
+			},
+			wantCaps: peerCapabilities{
+				capFeatureSSH:     true,
+				capFeatureSubnets: true,
+			},
+		},
+		{
+			name:   "tag-owned-random-canEdit-contents-get-dropped",
+			status: tagOwnedStatus,
+			whois: &apitype.WhoIsResponse{
+				Node: &tailcfg.Node{ID: tailcfg.NodeID(1)},
+				CapMap: tailcfg.PeerCapMap{
+					tailcfg.PeerCapabilityWebUI: []tailcfg.RawMessage{
+						"{\"canEdit\":[\"unknown-feature\"]}",
+					},
+				},
+			},
+			wantCaps: peerCapabilities{},
+		},
+		{
+			name:   "tag-owned-no-canEdit-section",
+			status: tagOwnedStatus,
+			whois: &apitype.WhoIsResponse{
+				Node: &tailcfg.Node{ID: tailcfg.NodeID(1)},
+				CapMap: tailcfg.PeerCapMap{
+					tailcfg.PeerCapabilityWebUI: []tailcfg.RawMessage{
+						"{\"canDoSomething\":[\"*\"]}",
+					},
+				},
+			},
+			wantCaps: peerCapabilities{},
+		},
+		{
+			name:   "tagged-source-caps-ignored",
+			status: tagOwnedStatus,
+			whois: &apitype.WhoIsResponse{
+				Node: &tailcfg.Node{ID: tailcfg.NodeID(1), Tags: tags.AsSlice()},
+				CapMap: tailcfg.PeerCapMap{
+					tailcfg.PeerCapabilityWebUI: []tailcfg.RawMessage{
+						"{\"canEdit\":[\"ssh\",\"subnets\"]}",
+					},
+				},
+			},
+			wantCaps: peerCapabilities{},
+		},
+	}
+	for _, tt := range toPeerCapsTests {
+		t.Run("toPeerCapabilities-"+tt.name, func(t *testing.T) {
+			got, err := toPeerCapabilities(tt.status, tt.whois)
+			if err != nil {
+				t.Fatalf("unexpected: %v", err)
+			}
+			if diff := cmp.Diff(got, tt.wantCaps); diff != "" {
+				t.Errorf("wrong caps; (-got+want):%v", diff)
+			}
+		})
+	}
+
+	// Testing web.peerCapabilities.canEdit
+	canEditTests := []struct {
+		name        string
+		caps        peerCapabilities
+		wantCanEdit map[capFeature]bool
+	}{
+		{
+			name: "empty-caps",
+			caps: nil,
+			wantCanEdit: map[capFeature]bool{
+				capFeatureAll:       false,
+				capFeatureSSH:       false,
+				capFeatureSubnets:   false,
+				capFeatureExitNodes: false,
+				capFeatureAccount:   false,
+			},
+		},
+		{
+			name: "some-caps",
+			caps: peerCapabilities{capFeatureSSH: true, capFeatureAccount: true},
+			wantCanEdit: map[capFeature]bool{
+				capFeatureAll:       false,
+				capFeatureSSH:       true,
+				capFeatureSubnets:   false,
+				capFeatureExitNodes: false,
+				capFeatureAccount:   true,
+			},
+		},
+		{
+			name: "wildcard-in-caps",
+			caps: peerCapabilities{capFeatureAll: true, capFeatureAccount: true},
+			wantCanEdit: map[capFeature]bool{
+				capFeatureAll:       true,
+				capFeatureSSH:       true,
+				capFeatureSubnets:   true,
+				capFeatureExitNodes: true,
+				capFeatureAccount:   true,
+			},
+		},
+	}
+	for _, tt := range canEditTests {
+		t.Run("canEdit-"+tt.name, func(t *testing.T) {
+			for f, want := range tt.wantCanEdit {
+				if got := tt.caps.canEdit(f); got != want {
+					t.Errorf("wrong canEdit(%s); got=%v, want=%v", f, got, want)
+				}
 			}
 		})
 	}
@@ -1031,6 +1452,9 @@ func mockLocalAPI(t *testing.T, whoIs map[string]*apitype.WhoIsResponse, self fu
 			}
 			metricCapture(metricNames[0].Name)
 			writeJSON(w, struct{}{})
+			return
+		case "/localapi/v0/logout":
+			fmt.Fprintf(w, "success")
 			return
 		default:
 			t.Fatalf("unhandled localapi test endpoint %q, add to localapi handler func in test", r.URL.Path)

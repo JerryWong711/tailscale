@@ -149,7 +149,7 @@ func genView(buf *bytes.Buffer, it *codegen.ImportTracker, typ *types.Named, thi
 		}
 	}
 	writeTemplate("common")
-	for i := 0; i < t.NumFields(); i++ {
+	for i := range t.NumFields() {
 		f := t.Field(i)
 		fname := f.Name()
 		if !f.Exported() {
@@ -172,6 +172,7 @@ func genView(buf *bytes.Buffer, it *codegen.ImportTracker, typ *types.Named, thi
 			switch elem.String() {
 			case "byte":
 				args.FieldType = it.QualifiedName(fieldType)
+				it.Import("tailscale.com/types/views")
 				writeTemplate("byteSliceField")
 			default:
 				args.FieldType = it.QualifiedName(elem)
@@ -291,7 +292,7 @@ func genView(buf *bytes.Buffer, it *codegen.ImportTracker, typ *types.Named, thi
 		}
 		writeTemplate("unsupportedField")
 	}
-	for i := 0; i < typ.NumMethods(); i++ {
+	for i := range typ.NumMethods() {
 		f := typ.Method(i)
 		if !f.Exported() {
 			continue

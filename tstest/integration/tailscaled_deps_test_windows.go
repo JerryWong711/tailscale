@@ -22,6 +22,7 @@ import (
 	_ "tailscale.com/cmd/tailscaled/childproc"
 	_ "tailscale.com/control/controlclient"
 	_ "tailscale.com/derp/derphttp"
+	_ "tailscale.com/drive/driveimpl"
 	_ "tailscale.com/envknob"
 	_ "tailscale.com/ipn"
 	_ "tailscale.com/ipn/conffile"

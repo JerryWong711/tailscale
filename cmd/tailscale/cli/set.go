@@ -10,20 +10,24 @@ import (
 	"fmt"
 	"net/netip"
 	"os/exec"
+	"strings"
 
 	"github.com/peterbourgon/ff/v3/ffcli"
+	"tailscale.com/client/web"
 	"tailscale.com/clientupdate"
+	"tailscale.com/cmd/tailscale/cli/ffcomplete"
 	"tailscale.com/ipn"
 	"tailscale.com/net/netutil"
 	"tailscale.com/net/tsaddr"
 	"tailscale.com/safesocket"
+	"tailscale.com/types/opt"
 	"tailscale.com/types/views"
 	"tailscale.com/version"
 )
 
 var setCmd = &ffcli.Command{
 	Name:       "set",
-	ShortUsage: "set [flags]",
+	ShortUsage: "tailscale set [flags]",
 	ShortHelp:  "Change specified preferences",
 	LongHelp: `"tailscale set" allows changing specific preferences.
 
@@ -72,8 +76,23 @@ func newSetFlagSet(goos string, setArgs *setArgsT) *flag.FlagSet {
 	setf.BoolVar(&setArgs.advertiseConnector, "advertise-connector", false, "offer to be an app connector for domain specific internet traffic for the tailnet")
 	setf.BoolVar(&setArgs.updateCheck, "update-check", true, "notify about available Tailscale updates")
 	setf.BoolVar(&setArgs.updateApply, "auto-update", false, "automatically update to the latest available version")
-	setf.BoolVar(&setArgs.postureChecking, "posture-checking", false, "HIDDEN: allow management plane to gather device posture information")
-	setf.BoolVar(&setArgs.runWebClient, "webclient", false, "run a web interface for managing this node, served over Tailscale at port 5252")
+	setf.BoolVar(&setArgs.postureChecking, "posture-checking", false, hidden+"allow management plane to gather device posture information")
+	setf.BoolVar(&setArgs.runWebClient, "webclient", false, "expose the web interface for managing this node over Tailscale at port 5252")
+
+	ffcomplete.Flag(setf, "exit-node", func(args []string) ([]string, ffcomplete.ShellCompDirective, error) {
+		st, err := localClient.Status(context.Background())
+		if err != nil {
+			return nil, 0, err
+		}
+		nodes := make([]string, 0, len(st.Peer))
+		for _, node := range st.Peer {
+			if !node.ExitNodeOption {
+				continue
+			}
+			nodes = append(nodes, strings.TrimSuffix(node.DNSName, "."))
+		}
+		return nodes, ffcomplete.ShellCompDirectiveNoFileComp, nil
+	})
 
 	if safesocket.GOOSUsesPeerCreds(goos) {
 		setf.StringVar(&setArgs.opUser, "operator", "", "Unix username to allow to operate on tailscaled without sudo")
@@ -116,7 +135,7 @@ func runSet(ctx context.Context, args []string) (retErr error) {
 			ForceDaemon:            setArgs.forceDaemon,
 			AutoUpdate: ipn.AutoUpdatePrefs{
 				Check: setArgs.updateCheck,
-				Apply: setArgs.updateApply,
+				Apply: opt.NewBool(setArgs.updateApply),
 			},
 			AppConnector: ipn.AppConnectorPrefs{
 				Advertise: setArgs.advertiseConnector,
@@ -172,7 +191,7 @@ func runSet(ctx context.Context, args []string) (retErr error) {
 		// does not use clientupdate.
 		if version.IsMacSysExt() {
 			apply := "0"
-			if maskedPrefs.AutoUpdate.Apply {
+			if maskedPrefs.AutoUpdate.Apply.EqualBool(true) {
 				apply = "1"
 			}
 			out, err := exec.Command("defaults", "write", "io.tailscale.ipn.macsys", "SUAutomaticallyUpdate", apply).CombinedOutput()
@@ -192,7 +211,15 @@ func runSet(ctx context.Context, args []string) (retErr error) {
 	}
 
 	_, err = localClient.EditPrefs(ctx, maskedPrefs)
-	return err
+	if err != nil {
+		return err
+	}
+
+	if setArgs.runWebClient && len(st.TailscaleIPs) > 0 {
+		printf("\nWeb interface now running at %s:%d", st.TailscaleIPs[0], web.ListenPort)
+	}
+
+	return nil
 }
 
 // calcAdvertiseRoutesForSet returns the new value for Prefs.AdvertiseRoutes based on the

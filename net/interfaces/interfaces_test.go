@@ -83,8 +83,8 @@ func TestLikelyHomeRouterIP(t *testing.T) {
 	})
 
 	// Mock out the likelyHomeRouterIP to return a known gateway.
-	tstest.Replace(t, &likelyHomeRouterIP, func() (netip.Addr, bool) {
-		return netip.MustParseAddr("192.168.7.1"), true
+	tstest.Replace(t, &likelyHomeRouterIP, func() (netip.Addr, netip.Addr, bool) {
+		return netip.MustParseAddr("192.168.7.1"), netip.Addr{}, true
 	})
 
 	gw, my, ok := LikelyHomeRouterIP()
@@ -177,8 +177,8 @@ func TestLikelyHomeRouterIP_Prefix(t *testing.T) {
 	})
 
 	// Mock out the likelyHomeRouterIP to return a known gateway.
-	tstest.Replace(t, &likelyHomeRouterIP, func() (netip.Addr, bool) {
-		return netip.MustParseAddr("192.168.7.1"), true
+	tstest.Replace(t, &likelyHomeRouterIP, func() (netip.Addr, netip.Addr, bool) {
+		return netip.MustParseAddr("192.168.7.1"), netip.Addr{}, true
 	})
 
 	gw, my, ok := LikelyHomeRouterIP()
@@ -284,29 +284,15 @@ func TestStateString(t *testing.T) {
 	}
 }
 
-func TestIsInterestingIP(t *testing.T) {
-	tests := []struct {
-		ip   string
-		want bool
-	}{
-		{"fd7a:115c:a1e0:ab12:4843:cd96:624a:4603", true}, // Tailscale private ULA
-		{"fd15:bbfa:c583:4fce:f4fb:4ff:fe1a:4148", true},  // Other private ULA
-		{"10.2.3.4", true},
-		{"127.0.0.1", false},
-		{"::1", false},
-		{"2001::2", true},
-		{"169.254.1.2", false},
-		{"fe80::1", false},
-	}
-	for _, tt := range tests {
-		if got := isInterestingIP(netip.MustParseAddr(tt.ip)); got != tt.want {
-			t.Errorf("isInterestingIP(%q) = %v, want %v", tt.ip, got, tt.want)
-		}
-	}
-}
-
 // tests (*State).Equal
 func TestEqual(t *testing.T) {
+	pfxs := func(addrs ...string) (ret []netip.Prefix) {
+		for _, addr := range addrs {
+			ret = append(ret, netip.MustParsePrefix(addr))
+		}
+		return ret
+	}
+
 	tests := []struct {
 		name   string
 		s1, s2 *State
@@ -379,6 +365,29 @@ func TestEqual(t *testing.T) {
 			s2: &State{
 				Interface: map[string]Interface{
 					"foo": {AltAddrs: []net.Addr{&net.TCPAddr{IP: net.ParseIP("5.6.7.8")}}},
+				},
+			},
+			want: false,
+		},
+
+		// See tailscale/corp#19124
+		{
+			name: "interface-removed",
+			s1: &State{
+				InterfaceIPs: map[string][]netip.Prefix{
+					"rmnet16":    pfxs("2607:1111:2222:3333:4444:5555:6666:7777/64"),
+					"rmnet17":    pfxs("2607:9999:8888:7777:666:5555:4444:3333/64"),
+					"tun0":       pfxs("100.64.1.2/32", "fd7a:115c:a1e0::1/128"),
+					"v4-rmnet16": pfxs("192.0.0.4/32"),
+					"wlan0":      pfxs("10.0.0.111/24"), // removed below
+				},
+			},
+			s2: &State{
+				InterfaceIPs: map[string][]netip.Prefix{
+					"rmnet16":    pfxs("2607:1111:2222:3333:4444:5555:6666:7777/64"),
+					"rmnet17":    pfxs("2607:9999:8888:7777:666:5555:4444:3333/64"),
+					"tun0":       pfxs("100.64.1.2/32", "fd7a:115c:a1e0::1/128"),
+					"v4-rmnet16": pfxs("192.0.0.4/32"),
 				},
 			},
 			want: false,

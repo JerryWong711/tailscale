@@ -9,7 +9,7 @@ import (
 )
 
 func fieldsOf(t reflect.Type) (fields []string) {
-	for i := 0; i < t.NumField(); i++ {
+	for i := range t.NumField() {
 		if name := t.Field(i).Name; name != "_" {
 			fields = append(fields, name)
 		}
@@ -20,7 +20,7 @@ func fieldsOf(t reflect.Type) (fields []string) {
 func TestStatusEqual(t *testing.T) {
 	// Verify that the Equal method stays in sync with reality
 	equalHandles := []string{"Err", "URL", "NetMap", "Persist", "state"}
-	if have := fieldsOf(reflect.TypeOf(Status{})); !reflect.DeepEqual(have, equalHandles) {
+	if have := fieldsOf(reflect.TypeFor[Status]()); !reflect.DeepEqual(have, equalHandles) {
 		t.Errorf("Status.Equal check might be out of sync\nfields: %q\nhandled: %q\n",
 			have, equalHandles)
 	}

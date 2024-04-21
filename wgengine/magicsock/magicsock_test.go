@@ -23,6 +23,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 	"unsafe"
@@ -41,9 +42,11 @@ import (
 	"tailscale.com/derp/derphttp"
 	"tailscale.com/disco"
 	"tailscale.com/envknob"
+	"tailscale.com/health"
 	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/net/connstats"
 	"tailscale.com/net/netaddr"
+	"tailscale.com/net/netcheck"
 	"tailscale.com/net/packet"
 	"tailscale.com/net/ping"
 	"tailscale.com/net/stun/stuntest"
@@ -168,6 +171,7 @@ func newMagicStackWithKey(t testing.TB, logf logger.Logf, l nettype.PacketListen
 	epCh := make(chan []tailcfg.Endpoint, 100) // arbitrary
 	conn, err := NewConn(Options{
 		Logf:                   logf,
+		DisablePortMapper:      true,
 		TestOnlyPacketListener: l,
 		EndpointsFunc: func(eps []tailcfg.Endpoint) {
 			epCh <- eps
@@ -373,9 +377,10 @@ func TestNewConn(t *testing.T) {
 
 	port := pickPort(t)
 	conn, err := NewConn(Options{
-		Port:          port,
-		EndpointsFunc: epFunc,
-		Logf:          t.Logf,
+		Port:              port,
+		DisablePortMapper: true,
+		EndpointsFunc:     epFunc,
+		Logf:              t.Logf,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -450,7 +455,7 @@ func TestPickDERPFallback(t *testing.T) {
 	}
 
 	// Test that it's consistent.
-	for i := 0; i < 50; i++ {
+	for range 50 {
 		b := c.pickDERPFallback()
 		if a != b {
 			t.Fatalf("got inconsistent %d vs %d values", a, b)
@@ -460,7 +465,7 @@ func TestPickDERPFallback(t *testing.T) {
 	// Test that that the pointer value of c is blended in and
 	// distribution over nodes works.
 	got := map[int]int{}
-	for i := 0; i < 50; i++ {
+	for range 50 {
 		c = newConn()
 		c.derpMap = dm
 		got[c.pickDERPFallback()]++
@@ -623,7 +628,7 @@ func (localhostListener) ListenPacket(ctx context.Context, network, address stri
 }
 
 func TestTwoDevicePing(t *testing.T) {
-	flakytest.Mark(t, "https://github.com/tailscale/tailscale/issues/1277")
+	flakytest.Mark(t, "https://github.com/tailscale/tailscale/issues/11762")
 	l, ip := localhostListener{}, netaddr.IPv4(127, 0, 0, 1)
 	n := &devices{
 		m1:     l,
@@ -1220,15 +1225,15 @@ func Test32bitAlignment(t *testing.T) {
 		},
 	}
 
-	if off := unsafe.Offsetof(de.lastRecv); off%8 != 0 {
-		t.Fatalf("endpoint.lastRecv is not 8-byte aligned")
+	if off := unsafe.Offsetof(de.lastRecvWG); off%8 != 0 {
+		t.Fatalf("endpoint.lastRecvWG is not 8-byte aligned")
 	}
 
-	de.noteRecvActivity(netip.AddrPort{}) // verify this doesn't panic on 32-bit
+	de.noteRecvActivity(netip.AddrPort{}, mono.Now()) // verify this doesn't panic on 32-bit
 	if called != 1 {
 		t.Fatal("expected call to noteRecvActivity")
 	}
-	de.noteRecvActivity(netip.AddrPort{})
+	de.noteRecvActivity(netip.AddrPort{}, mono.Now())
 	if called != 1 {
 		t.Error("expected no second call to noteRecvActivity")
 	}
@@ -1239,6 +1244,7 @@ func newTestConn(t testing.TB) *Conn {
 	t.Helper()
 	port := pickPort(t)
 	conn, err := NewConn(Options{
+		DisablePortMapper:      true,
 		Logf:                   t.Logf,
 		Port:                   port,
 		TestOnlyPacketListener: localhostListener{},
@@ -1405,7 +1411,7 @@ func TestReceiveFromAllocs(t *testing.T) {
 
 func BenchmarkReceiveFrom(b *testing.B) {
 	roundTrip := setUpReceiveFrom(b)
-	for i := 0; i < b.N; i++ {
+	for range b.N {
 		roundTrip()
 	}
 }
@@ -1432,7 +1438,7 @@ func BenchmarkReceiveFrom_Native(b *testing.B) {
 	}
 
 	buf := make([]byte, 2<<10)
-	for i := 0; i < b.N; i++ {
+	for range b.N {
 		if _, err := sendConn.WriteTo(sendBuf, dstAddr); err != nil {
 			b.Fatalf("WriteTo: %v", err)
 		}
@@ -1481,7 +1487,7 @@ func TestSetNetworkMapChangingNodeKey(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	for i := 0; i < 3; i++ {
+	for range 3 {
 		conn.SetNetworkMap(&netmap.NetworkMap{
 			Peers: nodeViews([]*tailcfg.Node{
 				{
@@ -1564,13 +1570,13 @@ func TestRebindStress(t *testing.T) {
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
-		for i := 0; i < 2000; i++ {
+		for range 2000 {
 			conn.Rebind()
 		}
 	}()
 	go func() {
 		defer wg.Done()
-		for i := 0; i < 2000; i++ {
+		for range 2000 {
 			conn.Rebind()
 		}
 	}()
@@ -1747,6 +1753,19 @@ func TestBetterAddr(t *testing.T) {
 			b:    al("192.168.0.1:555", 100*ms),
 			want: false,
 		},
+
+		// Link-local unicast addresses are preferred over other
+		// private IPs, but not as much as localhost addresses.
+		{
+			a:    al("[fe80::ce8:474a:a27e:113b]:555", 101*ms),
+			b:    al("[fd89:1a8a:8888:9999:aaaa:bbbb:cccc:dddd]:555", 100*ms),
+			want: true,
+		},
+		{
+			a:    al("[fe80::ce8:474a:a27e:113b]:555", 101*ms),
+			b:    al("[::1]:555", 100*ms),
+			want: false,
+		},
 	}
 	for i, tt := range tests {
 		got := betterAddr(tt.a, tt.b)
@@ -1811,7 +1830,7 @@ func TestStressSetNetworkMap(t *testing.T) {
 	prng := rand.New(rand.NewSource(int64(seed)))
 
 	const iters = 1000 // approx 0.5s on an m1 mac
-	for i := 0; i < iters; i++ {
+	for range iters {
 		for j := 0; j < npeers; j++ {
 			// Randomize which peers are present.
 			if prng.Int()&1 == 0 {
@@ -2199,7 +2218,7 @@ func Test_batchingUDPConn_coalesceMessages(t *testing.T) {
 			if got != len(tt.wantLens) {
 				t.Fatalf("got len %d want: %d", got, len(tt.wantLens))
 			}
-			for i := 0; i < got; i++ {
+			for i := range got {
 				if msgs[i].Addr != addr {
 					t.Errorf("msgs[%d].Addr != passed addr", i)
 				}
@@ -3003,4 +3022,173 @@ func TestAddrForPingSizeLocked(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestMaybeSetNearestDERP(t *testing.T) {
+	derpMap := &tailcfg.DERPMap{
+		Regions: map[int]*tailcfg.DERPRegion{
+			1: {
+				RegionID:   1,
+				RegionCode: "test",
+				Nodes: []*tailcfg.DERPNode{
+					{
+						Name:     "t1",
+						RegionID: 1,
+						HostName: "test-node.unused",
+						IPv4:     "127.0.0.1",
+						IPv6:     "none",
+					},
+				},
+			},
+			21: {
+				RegionID:   21,
+				RegionCode: "tor",
+				Nodes: []*tailcfg.DERPNode{
+					{
+						Name:     "21b",
+						RegionID: 21,
+						HostName: "tor.test-node.unused",
+						IPv4:     "127.0.0.1",
+						IPv6:     "none",
+					},
+				},
+			},
+			31: {
+				RegionID:   31,
+				RegionCode: "fallback",
+				Nodes: []*tailcfg.DERPNode{
+					{
+						Name:     "31b",
+						RegionID: 31,
+						HostName: "fallback.test-node.unused",
+						IPv4:     "127.0.0.1",
+						IPv6:     "none",
+					},
+				},
+			},
+		},
+	}
+
+	// Ensure that our fallback code always picks a deterministic value.
+	tstest.Replace(t, &pickDERPFallbackForTests, func() int { return 31 })
+
+	// Actually test this code path.
+	tstest.Replace(t, &checkControlHealthDuringNearestDERPInTests, true)
+
+	testCases := []struct {
+		name               string
+		old                int
+		reportDERP         int
+		connectedToControl bool
+		want               int
+	}{
+		{
+			name:               "connected_with_report_derp",
+			old:                1,
+			reportDERP:         21,
+			connectedToControl: true,
+			want:               21,
+		},
+		{
+			name:               "not_connected_with_report_derp",
+			old:                1,
+			reportDERP:         21,
+			connectedToControl: false,
+			want:               1, // no change
+		},
+		{
+			name:               "connected_no_derp",
+			old:                1,
+			reportDERP:         0,
+			connectedToControl: true,
+			want:               1, // no change
+		},
+		{
+			name:               "connected_no_derp_fallback",
+			old:                0,
+			reportDERP:         0,
+			connectedToControl: true,
+			want:               31, // deterministic fallback
+		},
+	}
+	for _, tt := range testCases {
+		t.Run(tt.name, func(t *testing.T) {
+			c := newConn()
+			c.logf = t.Logf
+			c.myDerp = tt.old
+			c.derpMap = derpMap
+
+			report := &netcheck.Report{PreferredDERP: tt.reportDERP}
+
+			oldConnected := health.GetInPollNetMap()
+			if tt.connectedToControl != oldConnected {
+				if tt.connectedToControl {
+					health.GotStreamedMapResponse()
+					t.Cleanup(health.SetOutOfPollNetMap)
+				} else {
+					health.SetOutOfPollNetMap()
+					t.Cleanup(health.GotStreamedMapResponse)
+				}
+			}
+
+			got := c.maybeSetNearestDERP(report)
+			if got != tt.want {
+				t.Errorf("got new DERP region %d, want %d", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestMaybeRebindOnError(t *testing.T) {
+	tstest.PanicOnLog()
+	tstest.ResourceCheck(t)
+
+	t.Run("darwin should rebind", func(t *testing.T) {
+		conn, err := NewConn(Options{
+			EndpointsFunc: func(eps []tailcfg.Endpoint) {},
+			Logf:          t.Logf,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer conn.Close()
+
+		rebound := conn.maybeRebindOnError("darwin", syscall.EPERM)
+		if !rebound {
+			t.Errorf("darwin should rebind on syscall.EPERM")
+		}
+	})
+
+	t.Run("linux should not rebind", func(t *testing.T) {
+		conn, err := NewConn(Options{
+			EndpointsFunc: func(eps []tailcfg.Endpoint) {},
+			Logf:          t.Logf,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer conn.Close()
+
+		rebound := conn.maybeRebindOnError("linux", syscall.EPERM)
+		if rebound {
+			t.Errorf("linux should not rebind on syscall.EPERM")
+		}
+	})
+
+	t.Run("should not rebind if recently rebind recently performed", func(t *testing.T) {
+		conn, err := NewConn(Options{
+			EndpointsFunc: func(eps []tailcfg.Endpoint) {},
+			Logf:          t.Logf,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer conn.Close()
+
+		conn.lastEPERMRebind.Store(time.Now().Add(-1 * time.Second))
+		rebound := conn.maybeRebindOnError("darwin", syscall.EPERM)
+		if rebound {
+			t.Errorf("darwin should not rebind on syscall.EPERM within 5 seconds of last")
+		}
+	})
 }

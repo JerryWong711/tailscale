@@ -4,12 +4,15 @@
 package controlclient
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"fmt"
+	"maps"
 	"net"
-	"net/netip"
 	"reflect"
+	"runtime"
+	"runtime/debug"
 	"slices"
 	"sort"
 	"strconv"
@@ -27,8 +30,8 @@ import (
 	"tailscale.com/types/ptr"
 	"tailscale.com/types/views"
 	"tailscale.com/util/clientmetric"
-	"tailscale.com/util/cmpx"
 	"tailscale.com/util/mak"
+	"tailscale.com/util/set"
 	"tailscale.com/wgengine/filter"
 )
 
@@ -72,6 +75,7 @@ type mapSession struct {
 	// Fields storing state over the course of multiple MapResponses.
 	lastPrintMap           time.Time
 	lastNode               tailcfg.NodeView
+	lastCapSet             set.Set[tailcfg.NodeCapability]
 	peers                  map[tailcfg.NodeID]*tailcfg.NodeView // pointer to view (oddly). same pointers as sortedPeers.
 	sortedPeers            []*tailcfg.NodeView                  // same pointers as peers, but sorted by Node.ID
 	lastDNSConfig          *tailcfg.DNSConfig
@@ -86,9 +90,9 @@ type mapSession struct {
 	lastDomainAuditLogID   string
 	lastHealth             []string
 	lastPopBrowserURL      string
-	stickyDebug            tailcfg.Debug // accumulated opt.Bool values
 	lastTKAInfo            *tailcfg.TKAInfo
 	lastNetmapSummary      string // from NetworkMap.VeryConcise
+	lastMaxExpiry          time.Duration
 }
 
 // newMapSession returns a mostly unconfigured new mapSession.
@@ -131,7 +135,7 @@ func (ms *mapSession) occasionallyPrintSummary(summary string) {
 }
 
 func (ms *mapSession) clock() tstime.Clock {
-	return cmpx.Or[tstime.Clock](ms.altClock, tstime.StdClock{})
+	return cmp.Or[tstime.Clock](ms.altClock, tstime.StdClock{})
 }
 
 func (ms *mapSession) Close() {
@@ -168,11 +172,19 @@ func (ms *mapSession) HandleNonKeepAliveMapResponse(ctx context.Context, resp *t
 			resp.Node.Capabilities = nil
 			resp.Node.CapMap = nil
 		}
-		ms.controlKnobs.UpdateFromNodeAttributes(resp.Node.Capabilities, resp.Node.CapMap)
+		// If the server is old and is still sending us Capabilities instead of
+		// CapMap, convert it to CapMap early so the rest of the client code can
+		// work only in terms of CapMap.
+		for _, c := range resp.Node.Capabilities {
+			if _, ok := resp.Node.CapMap[c]; !ok {
+				mak.Set(&resp.Node.CapMap, c, nil)
+			}
+		}
+		ms.controlKnobs.UpdateFromNodeAttributes(resp.Node.CapMap)
 	}
 
 	// Call Node.InitDisplayNames on any changed nodes.
-	initDisplayNames(cmpx.Or(resp.Node.View(), ms.lastNode), resp)
+	initDisplayNames(cmp.Or(resp.Node.View(), ms.lastNode), resp)
 
 	ms.patchifyPeersChanged(resp)
 
@@ -186,6 +198,12 @@ func (ms *mapSession) HandleNonKeepAliveMapResponse(ctx context.Context, resp *t
 	// We have to rebuild the whole netmap (lots of garbage & work downstream of
 	// our UpdateFullNetmap call). This is the part we tried to avoid but
 	// some field mutations (especially rare ones) aren't yet handled.
+
+	if runtime.GOOS == "ios" {
+		// Memory is tight on iOS. Free what we can while we
+		// can before this potential burst of in-use memory.
+		debug.FreeOSMemory()
+	}
 
 	nm := ms.netmap()
 	ms.lastNetmapSummary = nm.VeryConcise()
@@ -231,6 +249,15 @@ func (ms *mapSession) updateStateFromResponse(resp *tailcfg.MapResponse) {
 
 	if resp.Node != nil {
 		ms.lastNode = resp.Node.View()
+
+		capSet := set.Set[tailcfg.NodeCapability]{}
+		for _, c := range resp.Node.Capabilities {
+			capSet.Add(c)
+		}
+		for c := range resp.Node.CapMap {
+			capSet.Add(c)
+		}
+		ms.lastCapSet = capSet
 	}
 
 	for _, up := range resp.UserProfiles {
@@ -321,6 +348,9 @@ func (ms *mapSession) updateStateFromResponse(resp *tailcfg.MapResponse) {
 	if resp.TKAInfo != nil {
 		ms.lastTKAInfo = resp.TKAInfo
 	}
+	if resp.MaxKeyDuration > 0 {
+		ms.lastMaxExpiry = resp.MaxKeyDuration
+	}
 }
 
 var (
@@ -332,7 +362,6 @@ var (
 	patchOnline       = clientmetric.NewCounter("controlclient_patch_online")
 	patchLastSeen     = clientmetric.NewCounter("controlclient_patch_lastseen")
 	patchKeyExpiry    = clientmetric.NewCounter("controlclient_patch_keyexpiry")
-	patchCapabilities = clientmetric.NewCounter("controlclient_patch_capabilities")
 	patchCapMap       = clientmetric.NewCounter("controlclient_patch_capmap")
 	patchKeySignature = clientmetric.NewCounter("controlclient_patch_keysig")
 
@@ -454,10 +483,6 @@ func (ms *mapSession) updatePeersStateFromResponse(resp *tailcfg.MapResponse) (s
 			mut.KeyExpiry = *v
 			patchKeyExpiry.Add(1)
 		}
-		if v := pc.Capabilities; v != nil {
-			mut.Capabilities = *v
-			patchCapabilities.Add(1)
-		}
 		if v := pc.KeySignature; v != nil {
 			mut.KeySignature = v
 			patchKeySignature.Add(1)
@@ -536,9 +561,9 @@ var nodeFields = sync.OnceValue(getNodeFields)
 
 // getNodeFields returns the fails of tailcfg.Node.
 func getNodeFields() []string {
-	rt := reflect.TypeOf((*tailcfg.Node)(nil)).Elem()
+	rt := reflect.TypeFor[tailcfg.Node]()
 	ret := make([]string, rt.NumField())
-	for i := 0; i < rt.NumField(); i++ {
+	for i := range rt.NumField() {
 		ret[i] = rt.Field(i).Name
 	}
 	return ret
@@ -579,6 +604,9 @@ func peerChangeDiff(was tailcfg.NodeView, n *tailcfg.Node) (_ *tailcfg.PeerChang
 			continue
 		case "DataPlaneAuditLogID":
 			//  Not sent for peers.
+		case "Capabilities":
+			// Deprecated; see https://github.com/tailscale/tailscale/issues/11508
+			// And it was never sent by any known control server.
 		case "ID":
 			if was.ID() != n.ID {
 				return nil, false
@@ -662,9 +690,22 @@ func peerChangeDiff(was tailcfg.NodeView, n *tailcfg.Node) (_ *tailcfg.PeerChang
 				pc().Cap = n.Cap
 			}
 		case "CapMap":
-			if n.CapMap != nil {
-				pc().CapMap = n.CapMap
+			if len(n.CapMap) != was.CapMap().Len() {
+				if n.CapMap == nil {
+					pc().CapMap = make(tailcfg.NodeCapMap)
+				} else {
+					pc().CapMap = maps.Clone(n.CapMap)
+				}
+				break
 			}
+			was.CapMap().Range(func(k tailcfg.NodeCapability, v views.Slice[tailcfg.RawMessage]) bool {
+				nv, ok := n.CapMap[k]
+				if !ok || !views.SliceEqual(v, views.SliceOf(nv)) {
+					pc().CapMap = maps.Clone(n.CapMap)
+					return false
+				}
+				return true
+			})
 		case "Tags":
 			if !views.SliceEqual(was.Tags(), views.SliceOf(n.Tags)) {
 				return nil, false
@@ -686,10 +727,6 @@ func peerChangeDiff(was tailcfg.NodeView, n *tailcfg.Node) (_ *tailcfg.PeerChang
 		case "MachineAuthorized":
 			if was.MachineAuthorized() != n.MachineAuthorized {
 				return nil, false
-			}
-		case "Capabilities":
-			if !views.SliceEqual(was.Capabilities(), views.SliceOf(n.Capabilities)) {
-				pc().Capabilities = ptr.To(n.Capabilities)
 			}
 		case "UnsignedPeerAPIOnly":
 			if was.UnsignedPeerAPIOnly() != n.UnsignedPeerAPIOnly {
@@ -726,7 +763,7 @@ func peerChangeDiff(was tailcfg.NodeView, n *tailcfg.Node) (_ *tailcfg.PeerChang
 				return nil, false
 			}
 
-			for i := range va.LenIter() {
+			for i := range va.Len() {
 				if !va.At(i).Equal(vb.At(i)) {
 					return nil, false
 				}
@@ -765,6 +802,7 @@ func (ms *mapSession) netmap() *netmap.NetworkMap {
 		DERPMap:           ms.lastDERPMap,
 		ControlHealth:     ms.lastHealth,
 		TKAEnabled:        ms.lastTKAInfo != nil && !ms.lastTKAInfo.Disabled,
+		MaxKeyDuration:    ms.lastMaxExpiry,
 	}
 
 	if ms.lastTKAInfo != nil && ms.lastTKAInfo.Head != "" {
@@ -778,6 +816,7 @@ func (ms *mapSession) netmap() *netmap.NetworkMap {
 		nm.SelfNode = node
 		nm.Expiry = node.KeyExpiry()
 		nm.Name = node.Name()
+		nm.AllCaps = ms.lastCapSet
 	}
 
 	ms.addUserProfile(nm, nm.User())
@@ -789,44 +828,4 @@ func (ms *mapSession) netmap() *netmap.NetworkMap {
 		nm.DNS.Proxied = true
 	}
 	return nm
-}
-
-func nodesSorted(v []*tailcfg.Node) bool {
-	for i, n := range v {
-		if i > 0 && n.ID <= v[i-1].ID {
-			return false
-		}
-	}
-	return true
-}
-
-func sortNodes(v []*tailcfg.Node) {
-	sort.Slice(v, func(i, j int) bool { return v[i].ID < v[j].ID })
-}
-
-func cloneNodes(v1 []*tailcfg.Node) []*tailcfg.Node {
-	if v1 == nil {
-		return nil
-	}
-	v2 := make([]*tailcfg.Node, len(v1))
-	for i, n := range v1 {
-		v2[i] = n.Clone()
-	}
-	return v2
-}
-
-var debugSelfIPv6Only = envknob.RegisterBool("TS_DEBUG_SELF_V6_ONLY")
-
-func filterSelfAddresses(in []netip.Prefix) (ret []netip.Prefix) {
-	switch {
-	default:
-		return in
-	case debugSelfIPv6Only():
-		for _, a := range in {
-			if a.Addr().Is6() {
-				ret = append(ret, a)
-			}
-		}
-		return ret
-	}
 }

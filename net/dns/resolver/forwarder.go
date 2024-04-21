@@ -28,7 +28,6 @@ import (
 	"tailscale.com/net/dnscache"
 	"tailscale.com/net/neterror"
 	"tailscale.com/net/netmon"
-	"tailscale.com/net/netns"
 	"tailscale.com/net/sockstats"
 	"tailscale.com/net/tsdial"
 	"tailscale.com/types/dnstype"
@@ -394,8 +393,20 @@ func (f *forwarder) getKnownDoHClientForProvider(urlBase string) (c *http.Client
 	if err != nil {
 		return nil, false
 	}
-	nsDialer := netns.NewDialer(f.logf, f.netMon)
-	dialer := dnscache.Dialer(nsDialer.DialContext, &dnscache.Resolver{
+	// NOTE: use f.dialer.SystemDial so we close connections on a link
+	// change; on mobile devices when switching between WiFi and cellular,
+	// we need to ensure we don't retain a connection on the old interface
+	// or we can block DNS resolution.
+	//
+	// NOTE: if we ever support arbitrary user-defined DoH providers, this
+	// isn't sufficient; we'd need a dialer that dial a DoH server on the
+	// internet, without going through Tailscale (as SystemDial does), but
+	// also can dial a node on the tailnet (e.g. a PiHole).
+	//
+	// As of the time of writing (2024-02-11), this isn't a problem because
+	// we only support a restricted set of public DoH providers that aren't
+	// on a user's tailnet.
+	dialer := dnscache.Dialer(f.dialer.SystemDial, &dnscache.Resolver{
 		SingleHost:             dohURL.Hostname(),
 		SingleHostStaticResult: allIPs,
 		Logf:                   f.logf,
@@ -405,6 +416,9 @@ func (f *forwarder) getKnownDoHClientForProvider(urlBase string) (c *http.Client
 		Transport: &http.Transport{
 			ForceAttemptHTTP2: true,
 			IdleConnTimeout:   dohTransportTimeout,
+			// On mobile platforms TCP KeepAlive is disabled in the dialer,
+			// ensure that we timeout if the connection appears to be hung.
+			ResponseHeaderTimeout: 10 * time.Second,
 			DialContext: func(ctx context.Context, netw, addr string) (net.Conn, error) {
 				if !strings.HasPrefix(netw, "tcp") {
 					return nil, fmt.Errorf("unexpected network %q", netw)
@@ -460,6 +474,10 @@ func (f *forwarder) sendDoH(ctx context.Context, urlBase string, c *http.Client,
 var (
 	verboseDNSForward = envknob.RegisterBool("TS_DEBUG_DNS_FORWARD_SEND")
 	skipTCPRetry      = envknob.RegisterBool("TS_DNS_FORWARD_SKIP_TCP_RETRY")
+
+	// For correlating log messages in the send() function; only used when
+	// verboseDNSForward() is true.
+	forwarderCount atomic.Uint64
 )
 
 // send sends packet to dst. It is best effort.
@@ -467,9 +485,10 @@ var (
 // send expects the reply to have the same txid as txidOut.
 func (f *forwarder) send(ctx context.Context, fq *forwardQuery, rr resolverAndDelay) (ret []byte, err error) {
 	if verboseDNSForward() {
-		f.logf("forwarder.send(%q) ...", rr.name.Addr)
+		id := forwarderCount.Add(1)
+		f.logf("forwarder.send(%q) [%d] ...", rr.name.Addr, id)
 		defer func() {
-			f.logf("forwarder.send(%q) = %v, %v", rr.name.Addr, len(ret), err)
+			f.logf("forwarder.send(%q) [%d] = %v, %v", rr.name.Addr, id, len(ret), err)
 		}()
 	}
 	if strings.HasPrefix(rr.name.Addr, "http://") {

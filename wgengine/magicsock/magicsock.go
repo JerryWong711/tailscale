@@ -18,6 +18,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/tailscale/wireguard-go/conn"
@@ -60,6 +61,7 @@ import (
 	"tailscale.com/util/testenv"
 	"tailscale.com/util/uniq"
 	"tailscale.com/wgengine/capture"
+	"tailscale.com/wgengine/wgint"
 )
 
 const (
@@ -141,6 +143,8 @@ type Conn struct {
 
 	silentDiscoOn atomic.Bool // whether silent disco is enabled
 
+	probeUDPLifetimeOn atomic.Bool // whether probing of UDP lifetime is enabled
+
 	// noV4Send is whether IPv4 UDP is known to be unable to transmit
 	// at all. This could happen if the socket is in an invalid state
 	// (as can happen on darwin after a network link status change).
@@ -169,6 +173,8 @@ type Conn struct {
 	port atomic.Uint32
 
 	// peerMTUEnabled is whether path MTU discovery to peers is enabled.
+	//
+	//lint:ignore U1000 used on Linux/Darwin only
 	peerMTUEnabled atomic.Bool
 
 	// stats maintains per-connection counters.
@@ -192,6 +198,8 @@ type Conn struct {
 	// be held before derphttp.Client.mu.
 	mu     sync.Mutex
 	muCond *sync.Cond
+
+	onlyTCP443 atomic.Bool
 
 	closed  bool        // Close was called
 	closing atomic.Bool // Close is in progress (or done)
@@ -294,6 +302,14 @@ type Conn struct {
 	// onPortUpdate is called with the new port when magicsock rebinds to
 	// a new port.
 	onPortUpdate func(port uint16, network string)
+
+	// getPeerByKey optionally specifies a function to look up a peer's
+	// wireguard state by its public key. If nil, it's not used.
+	getPeerByKey func(key.NodePublic) (_ wgint.Peer, ok bool)
+
+	// lastEPERMRebind tracks the last time a rebind was performed
+	// after experiencing a syscall.EPERM.
+	lastEPERMRebind syncs.AtomicValue[time.Time]
 }
 
 // SetDebugLoggingEnabled controls whether spammy debug logging is enabled.
@@ -363,6 +379,15 @@ type Options struct {
 	// OnPortUpdate is called with the new port when magicsock rebinds to
 	// a new port.
 	OnPortUpdate func(port uint16, network string)
+
+	// PeerByKeyFunc optionally specifies a function to look up a peer's
+	// WireGuard state by its public key. If nil, it's not used.
+	// In regular use, this will be wgengine.(*userspaceEngine).PeerByKey.
+	PeerByKeyFunc func(key.NodePublic) (_ wgint.Peer, ok bool)
+
+	// DisablePortMapper, if true, disables the portmapper.
+	// This is primarily useful in tests.
+	DisablePortMapper bool
 }
 
 func (o *Options) logf() logger.Logf {
@@ -430,12 +455,16 @@ func NewConn(opts Options) (*Conn, error) {
 	c.idleFunc = opts.IdleFunc
 	c.testOnlyPacketListener = opts.TestOnlyPacketListener
 	c.noteRecvActivity = opts.NoteRecvActivity
-	c.portMapper = portmapper.NewClient(logger.WithPrefix(c.logf, "portmapper: "), opts.NetMon, nil, opts.ControlKnobs, c.onPortMapChanged)
+	portMapOpts := &portmapper.DebugKnobs{
+		DisableAll: func() bool { return opts.DisablePortMapper || c.onlyTCP443.Load() },
+	}
+	c.portMapper = portmapper.NewClient(logger.WithPrefix(c.logf, "portmapper: "), opts.NetMon, portMapOpts, opts.ControlKnobs, c.onPortMapChanged)
 	if opts.NetMon != nil {
 		c.portMapper.SetGatewayLookupFunc(opts.NetMon.GatewayAndSelfIP)
 	}
 	c.netMon = opts.NetMon
 	c.onPortUpdate = opts.OnPortUpdate
+	c.getPeerByKey = opts.PeerByKeyFunc
 
 	if err := c.rebind(keepCurrentPort); err != nil {
 		return nil, err
@@ -628,7 +657,17 @@ func (c *Conn) updateNetInfo(ctx context.Context) (*netcheck.Report, error) {
 	ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
 
-	report, err := c.netChecker.GetReport(ctx, dm)
+	report, err := c.netChecker.GetReport(ctx, dm, &netcheck.GetReportOpts{
+		// Pass information about the last time that we received a
+		// frame from a DERP server to our netchecker to help avoid
+		// flapping the home region while there's still active
+		// communication.
+		//
+		// NOTE(andrew-d): I don't love that we're depending on the
+		// health package here, but I'd rather do that and not store
+		// the exact same state in two different places.
+		GetLastDERPActivity: health.GetDERPRegionReceivedTime,
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -657,16 +696,7 @@ func (c *Conn) updateNetInfo(ctx context.Context) (*netcheck.Report, error) {
 	ni.OSHasIPv6.Set(report.OSHasIPv6)
 	ni.WorkingUDP.Set(report.UDP)
 	ni.WorkingICMPv4.Set(report.ICMPv4)
-	ni.PreferredDERP = report.PreferredDERP
-
-	if ni.PreferredDERP == 0 {
-		// Perhaps UDP is blocked. Pick a deterministic but arbitrary
-		// one.
-		ni.PreferredDERP = c.pickDERPFallback()
-	}
-	if !c.setNearestDERP(ni.PreferredDERP) {
-		ni.PreferredDERP = 0
-	}
+	ni.PreferredDERP = c.maybeSetNearestDERP(report)
 	ni.FirewallMode = hostinfo.FirewallMode()
 
 	c.callNetInfoCallback(ni)
@@ -737,7 +767,7 @@ func (c *Conn) LastRecvActivityOfNodeKey(nk key.NodePublic) string {
 	if !ok {
 		return "never"
 	}
-	saw := de.lastRecv.LoadAtomic()
+	saw := de.lastRecvWG.LoadAtomic()
 	if saw == 0 {
 		return "never"
 	}
@@ -1026,6 +1056,8 @@ func (c *Conn) sendUDPBatch(addr netip.AddrPort, buffs [][]byte) (sent bool, err
 		if errors.As(err, &errGSO) {
 			c.logf("magicsock: %s", errGSO.Error())
 			err = errGSO.RetryErr
+		} else {
+			_ = c.maybeRebindOnError(runtime.GOOS, err)
 		}
 	}
 	return err == nil, err
@@ -1040,6 +1072,7 @@ func (c *Conn) sendUDP(ipp netip.AddrPort, b []byte) (sent bool, err error) {
 	sent, err = c.sendUDPStd(ipp, b)
 	if err != nil {
 		metricSendUDPError.Add(1)
+		_ = c.maybeRebindOnError(runtime.GOOS, err)
 	} else {
 		if sent {
 			metricSendUDP.Add(1)
@@ -1048,9 +1081,40 @@ func (c *Conn) sendUDP(ipp netip.AddrPort, b []byte) (sent bool, err error) {
 	return
 }
 
+// maybeRebindOnError performs a rebind and restun if the error is defined and
+// any conditionals are met.
+func (c *Conn) maybeRebindOnError(os string, err error) bool {
+	switch err {
+	case syscall.EPERM:
+		why := "operation-not-permitted-rebind"
+		switch os {
+		// We currently will only rebind and restun on a syscall.EPERM if it is experienced
+		// on a client running darwin.
+		// TODO(charlotte, raggi): expand os options if required.
+		case "darwin":
+			// TODO(charlotte): implement a backoff, so we don't end up in a rebind loop for persistent
+			// EPERMs.
+			if c.lastEPERMRebind.Load().Before(time.Now().Add(-5 * time.Second)) {
+				c.logf("magicsock: performing %q", why)
+				c.lastEPERMRebind.Store(time.Now())
+				c.Rebind()
+				go c.ReSTUN(why)
+				return true
+			}
+		default:
+			c.logf("magicsock: not performing %q", why)
+			return false
+		}
+	}
+	return false
+}
+
 // sendUDP sends UDP packet b to addr.
 // See sendAddr's docs on the return value meanings.
 func (c *Conn) sendUDPStd(addr netip.AddrPort, b []byte) (sent bool, err error) {
+	if c.onlyTCP443.Load() {
+		return false, nil
+	}
 	switch {
 	case addr.Addr().Is4():
 		_, err = c.pconn4.WriteToUDPAddrPort(b, addr)
@@ -1224,7 +1288,9 @@ func (c *Conn) receiveIP(b []byte, ipp netip.AddrPort, cache *ippEndpointCache) 
 		cache.gen = de.numStopAndReset()
 		ep = de
 	}
-	ep.noteRecvActivity(ipp)
+	now := mono.Now()
+	ep.lastRecvUDPAny.StoreAtomic(now)
+	ep.noteRecvActivity(ipp, now)
 	if stats := c.stats.Load(); stats != nil {
 		stats.UpdateRxPhysical(ep.nodeAddr, ipp, len(b))
 	}
@@ -1305,7 +1371,7 @@ func (c *Conn) sendDiscoMessage(dst netip.AddrPort, dstKey key.NodePublic, dstDi
 	} else if err == nil {
 		// Can't send. (e.g. no IPv6 locally)
 	} else {
-		if !c.networkDown() {
+		if !c.networkDown() && pmtuShouldLogDiscoTxErr(m, err) {
 			c.logf("magicsock: disco: failed to send %v to %v: %v", disco.MessageSummary(m), dst, err)
 		}
 	}
@@ -1363,12 +1429,21 @@ func (c *Conn) handleDiscoMessage(msg []byte, src netip.AddrPort, derpNodeSrc ke
 		return
 	}
 
-	if !c.peerMap.anyEndpointForDiscoKey(sender) {
+	if !c.peerMap.knownPeerDiscoKey(sender) {
 		metricRecvDiscoBadPeer.Add(1)
 		if debugDisco() {
-			c.logf("magicsock: disco: ignoring disco-looking frame, don't know endpoint for %v", sender.ShortString())
+			c.logf("magicsock: disco: ignoring disco-looking frame, don't know of key %v", sender.ShortString())
 		}
 		return
+	}
+
+	isDERP := src.Addr() == tailcfg.DerpMagicIPAddr
+	if !isDERP {
+		// Record receive time for UDP transport packets.
+		pi, ok := c.peerMap.byIPPort[src]
+		if ok {
+			pi.ep.lastRecvUDPAny.StoreAtomic(mono.Now())
+		}
 	}
 
 	// We're now reasonably sure we're expecting communication from
@@ -1418,7 +1493,6 @@ func (c *Conn) handleDiscoMessage(msg []byte, src netip.AddrPort, derpNodeSrc ke
 		return
 	}
 
-	isDERP := src.Addr() == tailcfg.DerpMagicIPAddr
 	if isDERP {
 		metricRecvDiscoDERP.Add(1)
 	} else {
@@ -1769,7 +1843,7 @@ func nodesEqual(x, y views.Slice[tailcfg.NodeView]) bool {
 	if x.Len() != y.Len() {
 		return false
 	}
-	for i := range x.LenIter() {
+	for i := range x.Len() {
 		if !x.At(i).Equal(y.At(i)) {
 			return false
 		}
@@ -1789,9 +1863,11 @@ func debugRingBufferSize(numPeers int) int {
 	}
 	var maxRingBufferSize int
 	if runtime.GOOS == "ios" || runtime.GOOS == "android" {
-		maxRingBufferSize = 1 * 1024 * 1024
+		maxRingBufferSize = 1 << 20
+		// But as of 2024-03-20, we now just disable the ring buffer entirely
+		// on mobile as it hadn't proven useful enough to justify even 1 MB.
 	} else {
-		maxRingBufferSize = 4 * 1024 * 1024
+		maxRingBufferSize = 4 << 20
 	}
 	if v := debugRingBufferMaxSizeBytes(); v > 0 {
 		maxRingBufferSize = v
@@ -1805,11 +1881,13 @@ func debugRingBufferSize(numPeers int) int {
 // They might be set by envknob and/or controlknob.
 // The value is comparable.
 type debugFlags struct {
-	heartbeatDisabled bool
+	heartbeatDisabled  bool
+	probeUDPLifetimeOn bool
 }
 
 func (c *Conn) debugFlagsLocked() (f debugFlags) {
 	f.heartbeatDisabled = debugEnableSilentDisco() || c.silentDiscoOn.Load()
+	f.probeUDPLifetimeOn = c.probeUDPLifetimeOn.Load()
 	return
 }
 
@@ -1832,6 +1910,19 @@ func (c *Conn) SilentDisco() bool {
 	defer c.mu.Unlock()
 	flags := c.debugFlagsLocked()
 	return flags.heartbeatDisabled
+}
+
+// SetProbeUDPLifetime toggles probing of UDP lifetime based on v.
+func (c *Conn) SetProbeUDPLifetime(v bool) {
+	old := c.probeUDPLifetimeOn.Swap(v)
+	if old == v {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.peerMap.forEachEndpoint(func(ep *endpoint) {
+		ep.setProbeUDPLifetimeOn(v)
+	})
 }
 
 // SetNetworkMap is called when the control client gets a new network
@@ -1864,7 +1955,8 @@ func (c *Conn) SetNetworkMap(nm *netmap.NetworkMap) {
 	if nodesEqual(priorPeers, curPeers) && c.lastFlags == flags {
 		// The rest of this function is all adjusting state for peers that have
 		// changed. But if the set of peers is equal and the debug flags (for
-		// silent disco) haven't changed, no need to do anything else.
+		// silent disco and probe UDP lifetime) haven't changed, there is no
+		// need to do anything else.
 		return
 	}
 
@@ -1915,7 +2007,7 @@ func (c *Conn) SetNetworkMap(nm *netmap.NetworkMap) {
 			if epDisco := ep.disco.Load(); epDisco != nil {
 				oldDiscoKey = epDisco.key
 			}
-			ep.updateFromNode(n, flags.heartbeatDisabled)
+			ep.updateFromNode(n, flags.heartbeatDisabled, flags.probeUDPLifetimeOn)
 			c.peerMap.upsertEndpoint(ep, oldDiscoKey) // maybe update discokey mappings in peerMap
 			continue
 		}
@@ -1942,7 +2034,6 @@ func (c *Conn) SetNetworkMap(nm *netmap.NetworkMap) {
 
 		ep = &endpoint{
 			c:                 c,
-			debugUpdates:      ringbuffer.New[EndpointChange](entriesPerBuffer),
 			nodeID:            n.ID(),
 			publicKey:         n.Key(),
 			publicKeyHex:      n.Key().UntypedHexString(),
@@ -1950,6 +2041,14 @@ func (c *Conn) SetNetworkMap(nm *netmap.NetworkMap) {
 			endpointState:     map[netip.AddrPort]*endpointState{},
 			heartbeatDisabled: flags.heartbeatDisabled,
 			isWireguardOnly:   n.IsWireGuardOnly(),
+		}
+		switch runtime.GOOS {
+		case "ios", "android":
+			// Omit, to save memory. Prior to 2024-03-20 we used to limit it to
+			// ~1MB on mobile but we never used the data so the memory was just
+			// wasted.
+		default:
+			ep.debugUpdates = ringbuffer.New[EndpointChange](entriesPerBuffer)
 		}
 		if n.Addresses().Len() > 0 {
 			ep.nodeAddr = n.Addresses().At(0).Addr()
@@ -1968,7 +2067,7 @@ func (c *Conn) SetNetworkMap(nm *netmap.NetworkMap) {
 			c.logEndpointCreated(n)
 		}
 
-		ep.updateFromNode(n, flags.heartbeatDisabled)
+		ep.updateFromNode(n, flags.heartbeatDisabled, flags.probeUDPLifetimeOn)
 		c.peerMap.upsertEndpoint(ep, key.DiscoPublic{})
 	}
 
@@ -1991,7 +2090,7 @@ func (c *Conn) SetNetworkMap(nm *netmap.NetworkMap) {
 
 	// discokeys might have changed in the above. Discard unused info.
 	for dk := range c.discoInfo {
-		if !c.peerMap.anyEndpointForDiscoKey(dk) {
+		if !c.peerMap.knownPeerDiscoKey(dk) {
 			delete(c.discoInfo, dk)
 		}
 	}
@@ -2016,7 +2115,7 @@ func (c *Conn) logEndpointCreated(n tailcfg.NodeView) {
 			fmt.Fprintf(w, "derp=%v%s ", regionID, code)
 		}
 
-		for i := range n.AllowedIPs().LenIter() {
+		for i := range n.AllowedIPs().Len() {
 			a := n.AllowedIPs().At(i)
 			if a.IsSingleIP() {
 				fmt.Fprintf(w, "aip=%v ", a.Addr())
@@ -2024,7 +2123,7 @@ func (c *Conn) logEndpointCreated(n tailcfg.NodeView) {
 				fmt.Fprintf(w, "aip=%v ", a)
 			}
 		}
-		for i := range n.Endpoints().LenIter() {
+		for i := range n.Endpoints().Len() {
 			ep := n.Endpoints().At(i)
 			fmt.Fprintf(w, "ep=%v ", ep)
 		}
@@ -2923,7 +3022,9 @@ var (
 	metricDERPHomeChange = clientmetric.NewCounter("derp_home_change")
 
 	// Disco packets received bpf read path
+	//lint:ignore U1000 used on Linux only
 	metricRecvDiscoPacketIPv4 = clientmetric.NewCounter("magicsock_disco_recv_bpf_ipv4")
+	//lint:ignore U1000 used on Linux only
 	metricRecvDiscoPacketIPv6 = clientmetric.NewCounter("magicsock_disco_recv_bpf_ipv6")
 
 	// metricMaxPeerMTUProbed is the largest peer path MTU we successfully probed.
@@ -2933,10 +3034,50 @@ var (
 	// received an peer MTU probe response for a given MTU size.
 	// TODO: add proper support for label maps in clientmetrics
 	metricRecvDiscoPeerMTUProbesByMTU syncs.Map[string, *clientmetric.Metric]
+
+	// metricUDPLifetime* metrics pertain to UDP lifetime probing, see type
+	// probeUDPLifetime. These metrics assume a static/default configuration for
+	// probing (defaultProbeUDPLifetimeConfig) until we disseminate
+	// ProbeUDPLifetimeConfig from control, and have lifetime management (GC old
+	// metrics) of clientmetrics or similar.
+	metricUDPLifetimeCliffsScheduled             = newUDPLifetimeCounter("magicsock_udp_lifetime_cliffs_scheduled")
+	metricUDPLifetimeCliffsCompleted             = newUDPLifetimeCounter("magicsock_udp_lifetime_cliffs_completed")
+	metricUDPLifetimeCliffsMissed                = newUDPLifetimeCounter("magicsock_udp_lifetime_cliffs_missed")
+	metricUDPLifetimeCliffsRescheduled           = newUDPLifetimeCounter("magicsock_udp_lifetime_cliffs_rescheduled")
+	metricUDPLifetimeCyclesCompleted             = newUDPLifetimeCounter("magicsock_udp_lifetime_cycles_completed")
+	metricUDPLifetimeCycleCompleteNoCliffReached = newUDPLifetimeCounter("magicsock_udp_lifetime_cycle_complete_no_cliff_reached")
+	metricUDPLifetimeCycleCompleteAt10sCliff     = newUDPLifetimeCounter("magicsock_udp_lifetime_cycle_complete_at_10s_cliff")
+	metricUDPLifetimeCycleCompleteAt30sCliff     = newUDPLifetimeCounter("magicsock_udp_lifetime_cycle_complete_at_30s_cliff")
+	metricUDPLifetimeCycleCompleteAt60sCliff     = newUDPLifetimeCounter("magicsock_udp_lifetime_cycle_complete_at_60s_cliff")
 )
+
+// newUDPLifetimeCounter returns a new *clientmetric.Metric with the provided
+// name combined with a suffix representing defaultProbeUDPLifetimeConfig.
+func newUDPLifetimeCounter(name string) *clientmetric.Metric {
+	var sb strings.Builder
+	for _, cliff := range defaultProbeUDPLifetimeConfig.Cliffs {
+		sb.WriteString(fmt.Sprintf("%ds", cliff/time.Second))
+	}
+	sb.WriteString(fmt.Sprintf("_%ds", defaultProbeUDPLifetimeConfig.CycleCanStartEvery/time.Second))
+	return clientmetric.NewCounter(fmt.Sprintf("%s_%s", name, sb.String()))
+}
 
 func getPeerMTUsProbedMetric(mtu tstun.WireMTU) *clientmetric.Metric {
 	key := fmt.Sprintf("magicsock_recv_disco_peer_mtu_probes_by_mtu_%d", mtu)
 	mm, _ := metricRecvDiscoPeerMTUProbesByMTU.LoadOrInit(key, func() *clientmetric.Metric { return clientmetric.NewCounter(key) })
 	return mm
+}
+
+// GetLastNetcheckReport returns the last netcheck report, running a new one if a recent one does not exist.
+func (c *Conn) GetLastNetcheckReport(ctx context.Context) *netcheck.Report {
+	lastReport := c.lastNetCheckReport.Load()
+	if lastReport == nil {
+		nr, err := c.updateNetInfo(ctx)
+		if err != nil {
+			c.logf("magicsock.Conn.GetLastNetcheckReport: updateNetInfo: %v", err)
+			return nil
+		}
+		return nr
+	}
+	return lastReport
 }

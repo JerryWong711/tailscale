@@ -11,6 +11,7 @@ import (
 	"tailscale.com/types/preftype"
 )
 
+//lint:ignore U1000 used in Windows/Linux tests only
 func mustCIDRs(ss ...string) []netip.Prefix {
 	var ret []netip.Prefix
 	for _, s := range ss {
@@ -25,9 +26,9 @@ func TestConfigEqual(t *testing.T) {
 		"SubnetRoutes", "SNATSubnetRoutes", "NetfilterMode",
 		"NetfilterKind",
 	}
-	configType := reflect.TypeOf(Config{})
+	configType := reflect.TypeFor[Config]()
 	configFields := []string{}
-	for i := 0; i < configType.NumField(); i++ {
+	for i := range configType.NumField() {
 		configFields = append(configFields, configType.Field(i).Name)
 	}
 	if !reflect.DeepEqual(configFields, testedFields) {

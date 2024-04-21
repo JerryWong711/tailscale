@@ -40,18 +40,6 @@ const maxActiveQueries = 256
 // the lint exception is necessary and on others it is not,
 // and plain ignore complains if the exception is unnecessary.
 
-// reconfigTimeout is the time interval within which Manager.{Up,Down} should complete.
-//
-// This is particularly useful because certain conditions can cause indefinite hangs
-// (such as improper dbus auth followed by contextless dbus.Object.Call).
-// Such operations should be wrapped in a timeout context.
-const reconfigTimeout = time.Second
-
-type response struct {
-	pkt []byte
-	to  netip.AddrPort // response destination (request source)
-}
-
 // Manager manages system DNS settings.
 type Manager struct {
 	logf logger.Logf
@@ -461,10 +449,10 @@ func (m *Manager) FlushCaches() error {
 	return flushCaches()
 }
 
-// Cleanup restores the system DNS configuration to its original state
+// CleanUp restores the system DNS configuration to its original state
 // in case the Tailscale daemon terminated without closing the router.
 // No other state needs to be instantiated before this runs.
-func Cleanup(logf logger.Logf, interfaceName string) {
+func CleanUp(logf logger.Logf, interfaceName string) {
 	oscfg, err := NewOSConfigurator(logf, interfaceName)
 	if err != nil {
 		logf("creating dns cleanup: %v", err)

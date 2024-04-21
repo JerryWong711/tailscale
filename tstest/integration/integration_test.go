@@ -29,6 +29,7 @@ import (
 	"time"
 
 	"go4.org/mem"
+	"tailscale.com/clientupdate"
 	"tailscale.com/cmd/testwrapper/flakytest"
 	"tailscale.com/ipn"
 	"tailscale.com/ipn/ipnlocal"
@@ -41,6 +42,7 @@ import (
 	"tailscale.com/tstest/integration/testcontrol"
 	"tailscale.com/types/key"
 	"tailscale.com/types/logger"
+	"tailscale.com/types/opt"
 	"tailscale.com/types/ptr"
 	"tailscale.com/util/must"
 	"tailscale.com/util/rands"
@@ -343,7 +345,6 @@ func TestConfigFileAuthKey(t *testing.T) {
 
 func TestTwoNodes(t *testing.T) {
 	tstest.Shard(t)
-	flakytest.Mark(t, "https://github.com/tailscale/tailscale/issues/3598")
 	tstest.Parallel(t)
 	env := newTestEnv(t)
 
@@ -380,6 +381,11 @@ func TestTwoNodes(t *testing.T) {
 		if peer.ID == st.Self.ID {
 			return errors.New("peer is self")
 		}
+
+		if len(st.TailscaleIPs) == 0 {
+			return errors.New("no Tailscale IPs")
+		}
+
 		return nil
 	}); err != nil {
 		t.Error(err)
@@ -393,7 +399,6 @@ func TestTwoNodes(t *testing.T) {
 // PeersRemoved set) saying that the second node disappeared.
 func TestIncrementalMapUpdatePeersRemoved(t *testing.T) {
 	tstest.Shard(t)
-	flakytest.Mark(t, "https://github.com/tailscale/tailscale/issues/3598")
 	tstest.Parallel(t)
 	env := newTestEnv(t)
 
@@ -560,16 +565,11 @@ func TestAddPingRequest(t *testing.T) {
 func TestC2NPingRequest(t *testing.T) {
 	tstest.Shard(t)
 	tstest.Parallel(t)
-	env := newTestEnv(t)
-	n1 := newTestNode(t, env)
-	n1.StartDaemon()
 
-	n1.AwaitListening()
-	n1.MustUp()
-	n1.AwaitRunning()
+	env := newTestEnv(t)
 
 	gotPing := make(chan bool, 1)
-	waitPing := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	env.Control.HandleC2N = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != "POST" {
 			t.Errorf("unexpected ping method %q", r.Method)
 		}
@@ -582,8 +582,14 @@ func TestC2NPingRequest(t *testing.T) {
 			t.Errorf("body error\n got: %q\nwant: %q", got, want)
 		}
 		gotPing <- true
-	}))
-	defer waitPing.Close()
+	})
+
+	n1 := newTestNode(t, env)
+	n1.StartDaemon()
+
+	n1.AwaitListening()
+	n1.MustUp()
+	n1.AwaitRunning()
 
 	nodes := env.Control.AllNodes()
 	if len(nodes) != 1 {
@@ -602,7 +608,7 @@ func TestC2NPingRequest(t *testing.T) {
 		cancel()
 
 		pr := &tailcfg.PingRequest{
-			URL:     fmt.Sprintf("%s/ping-%d", waitPing.URL, try),
+			URL:     fmt.Sprintf("https://unused/some-c2n-path/ping-%d", try),
 			Log:     true,
 			Types:   "c2n",
 			Payload: []byte("POST /echo HTTP/1.0\r\nContent-Length: 3\r\n\r\nabc"),
@@ -650,17 +656,14 @@ func TestNoControlConnWhenDown(t *testing.T) {
 	d2 := n1.StartDaemon()
 	n1.AwaitResponding()
 
-	st := n1.MustStatus()
-	if got, want := st.BackendState, "Stopped"; got != want {
-		t.Fatalf("after restart, state = %q; want %q", got, want)
-	}
+	n1.AwaitBackendState("Stopped")
 
 	ip2 := n1.AwaitIP4()
 	if ip1 != ip2 {
 		t.Errorf("IPs different: %q vs %q", ip1, ip2)
 	}
 
-	// The real test: verify our daemon doesn't have an HTTP request open.:
+	// The real test: verify our daemon doesn't have an HTTP request open.
 	if n := env.Control.InServeMap(); n != 0 {
 		t.Errorf("in serve map = %d; want 0", n)
 	}
@@ -872,6 +875,99 @@ func TestLogoutRemovesAllPeers(t *testing.T) {
 	wantNode0PeerCount(expectedPeers) // all existing peers and the new node
 }
 
+func TestAutoUpdateDefaults(t *testing.T) {
+	if !clientupdate.CanAutoUpdate() {
+		t.Skip("auto-updates not supported on this platform")
+	}
+	tstest.Shard(t)
+	tstest.Parallel(t)
+	env := newTestEnv(t)
+
+	checkDefault := func(n *testNode, want bool) error {
+		enabled, ok := n.diskPrefs().AutoUpdate.Apply.Get()
+		if !ok {
+			return fmt.Errorf("auto-update for node is unset, should be set as %v", want)
+		}
+		if enabled != want {
+			return fmt.Errorf("auto-update for node is %v, should be set as %v", enabled, want)
+		}
+		return nil
+	}
+
+	sendAndCheckDefault := func(t *testing.T, n *testNode, send, want bool) {
+		t.Helper()
+		if !env.Control.AddRawMapResponse(n.MustStatus().Self.PublicKey, &tailcfg.MapResponse{
+			DefaultAutoUpdate: opt.NewBool(send),
+		}) {
+			t.Fatal("failed to send MapResponse to node")
+		}
+		if err := tstest.WaitFor(2*time.Second, func() error {
+			return checkDefault(n, want)
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	tests := []struct {
+		desc string
+		run  func(t *testing.T, n *testNode)
+	}{
+		{
+			desc: "tailnet-default-false",
+			run: func(t *testing.T, n *testNode) {
+				// First received default "false".
+				sendAndCheckDefault(t, n, false, false)
+				// Should not be changed even if sent "true" later.
+				sendAndCheckDefault(t, n, true, false)
+				// But can be changed explicitly by the user.
+				if out, err := n.Tailscale("set", "--auto-update").CombinedOutput(); err != nil {
+					t.Fatalf("failed to enable auto-update on node: %v\noutput: %s", err, out)
+				}
+				sendAndCheckDefault(t, n, false, true)
+			},
+		},
+		{
+			desc: "tailnet-default-true",
+			run: func(t *testing.T, n *testNode) {
+				// First received default "true".
+				sendAndCheckDefault(t, n, true, true)
+				// Should not be changed even if sent "false" later.
+				sendAndCheckDefault(t, n, false, true)
+				// But can be changed explicitly by the user.
+				if out, err := n.Tailscale("set", "--auto-update=false").CombinedOutput(); err != nil {
+					t.Fatalf("failed to disable auto-update on node: %v\noutput: %s", err, out)
+				}
+				sendAndCheckDefault(t, n, true, false)
+			},
+		},
+		{
+			desc: "user-sets-first",
+			run: func(t *testing.T, n *testNode) {
+				// User sets auto-update first, before receiving defaults.
+				if out, err := n.Tailscale("set", "--auto-update=false").CombinedOutput(); err != nil {
+					t.Fatalf("failed to disable auto-update on node: %v\noutput: %s", err, out)
+				}
+				// Defaults sent from control should be ignored.
+				sendAndCheckDefault(t, n, true, false)
+				sendAndCheckDefault(t, n, false, false)
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.desc, func(t *testing.T) {
+			n := newTestNode(t, env)
+			d := n.StartDaemon()
+			defer d.MustCleanShutdown(t)
+
+			n.AwaitResponding()
+			n.MustUp()
+			n.AwaitRunning()
+
+			tt.run(t, n)
+		})
+	}
+}
+
 // testEnv contains the test environment (set of servers) used by one
 // or more nodes.
 type testEnv struct {
@@ -906,7 +1002,6 @@ func newTestEnv(t testing.TB, opts ...testEnvOpt) *testEnv {
 	if runtime.GOOS == "windows" {
 		t.Skip("not tested/working on Windows yet")
 	}
-	flakytest.Mark(t, "https://github.com/tailscale/tailscale/issues/7036")
 	derpMap := RunDERPAndSTUN(t, logger.Discard, "127.0.0.1")
 	logc := new(LogCatcher)
 	control := &testcontrol.Server{
@@ -1226,9 +1321,8 @@ func (n *testNode) Ping(otherNode *testNode) error {
 // over its localhost IPC mechanism. (Unix socket, etc)
 func (n *testNode) AwaitListening() {
 	t := n.env.t
-	s := safesocket.DefaultConnectionStrategy(n.sockFile)
 	if err := tstest.WaitFor(20*time.Second, func() (err error) {
-		c, err := safesocket.Connect(s)
+		c, err := safesocket.Connect(n.sockFile)
 		if err == nil {
 			c.Close()
 		}
@@ -1289,6 +1383,10 @@ func (n *testNode) AwaitIP6() netip.Addr {
 
 // AwaitRunning waits for n to reach the IPN state "Running".
 func (n *testNode) AwaitRunning() {
+	n.AwaitBackendState("Running")
+}
+
+func (n *testNode) AwaitBackendState(state string) {
 	t := n.env.t
 	t.Helper()
 	if err := tstest.WaitFor(20*time.Second, func() error {
@@ -1296,8 +1394,8 @@ func (n *testNode) AwaitRunning() {
 		if err != nil {
 			return err
 		}
-		if st.BackendState != "Running" {
-			return fmt.Errorf("in state %q", st.BackendState)
+		if st.BackendState != state {
+			return fmt.Errorf("in state %q; want %q", st.BackendState, state)
 		}
 		return nil
 	}); err != nil {

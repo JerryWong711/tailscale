@@ -104,9 +104,10 @@ func newIPN(jsConfig js.Value) map[string]any {
 	sys.Set(store)
 	dialer := &tsdial.Dialer{Logf: logf}
 	eng, err := wgengine.NewUserspaceEngine(logf, wgengine.Config{
-		Dialer:       dialer,
-		SetSubsystem: sys.Set,
-		ControlKnobs: sys.ControlKnobs(),
+		Dialer:        dialer,
+		SetSubsystem:  sys.Set,
+		ControlKnobs:  sys.ControlKnobs(),
+		HealthTracker: sys.HealthTracker(),
 	})
 	if err != nil {
 		log.Fatal(err)
@@ -297,11 +298,10 @@ func (i *jsIPN) run(jsCallbacks js.Value) {
 	go func() {
 		err := i.lb.Start(ipn.Options{
 			UpdatePrefs: &ipn.Prefs{
-				ControlURL:       i.controlURL,
-				RouteAll:         false,
-				AllowSingleHosts: true,
-				WantRunning:      true,
-				Hostname:         i.hostname,
+				ControlURL:  i.controlURL,
+				RouteAll:    false,
+				WantRunning: true,
+				Hostname:    i.hostname,
 			},
 			AuthKey: i.authKey,
 		})

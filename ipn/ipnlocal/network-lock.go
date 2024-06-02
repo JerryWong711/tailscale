@@ -20,7 +20,6 @@ import (
 	"path/filepath"
 	"time"
 
-	"tailscale.com/health"
 	"tailscale.com/health/healthmsg"
 	"tailscale.com/ipn"
 	"tailscale.com/ipn/ipnstate"
@@ -59,11 +58,11 @@ type tkaState struct {
 // b.mu must be held.
 func (b *LocalBackend) tkaFilterNetmapLocked(nm *netmap.NetworkMap) {
 	if b.tka == nil && !b.capTailnetLock {
-		health.SetTKAHealth(nil)
+		b.health.SetTKAHealth(nil)
 		return
 	}
 	if b.tka == nil {
-		health.SetTKAHealth(nil)
+		b.health.SetTKAHealth(nil)
 		return // TKA not enabled.
 	}
 
@@ -117,9 +116,9 @@ func (b *LocalBackend) tkaFilterNetmapLocked(nm *netmap.NetworkMap) {
 
 	// Check that we ourselves are not locked out, report a health issue if so.
 	if nm.SelfNode.Valid() && b.tka.authority.NodeKeyAuthorized(nm.SelfNode.Key(), nm.SelfNode.KeySignature().AsSlice()) != nil {
-		health.SetTKAHealth(errors.New(healthmsg.LockedOut))
+		b.health.SetTKAHealth(errors.New(healthmsg.LockedOut))
 	} else {
-		health.SetTKAHealth(nil)
+		b.health.SetTKAHealth(nil)
 	}
 }
 
@@ -188,7 +187,7 @@ func (b *LocalBackend) tkaSyncIfNeeded(nm *netmap.NetworkMap, prefs ipn.PrefsVie
 				b.logf("Disablement failed, leaving TKA enabled. Error: %v", err)
 			} else {
 				isEnabled = false
-				health.SetTKAHealth(nil)
+				b.health.SetTKAHealth(nil)
 			}
 		} else {
 			return fmt.Errorf("[bug] unreachable invariant of wantEnabled w/ isEnabled")
@@ -424,8 +423,12 @@ func (b *LocalBackend) NetworkLockStatus() *ipnstate.NetworkLockStatus {
 	copy(head[:], h[:])
 
 	var selfAuthorized bool
+	nodeKeySignature := &tka.NodeKeySignature{}
 	if b.netMap != nil {
 		selfAuthorized = b.tka.authority.NodeKeyAuthorized(b.netMap.SelfNode.Key(), b.netMap.SelfNode.KeySignature().AsSlice()) == nil
+		if err := nodeKeySignature.Unserialize(b.netMap.SelfNode.KeySignature().AsSlice()); err != nil {
+			b.logf("failed to decode self node key signature: %v", err)
+		}
 	}
 
 	keys := b.tka.authority.Keys()
@@ -446,14 +449,15 @@ func (b *LocalBackend) NetworkLockStatus() *ipnstate.NetworkLockStatus {
 	stateID1, _ := b.tka.authority.StateIDs()
 
 	return &ipnstate.NetworkLockStatus{
-		Enabled:       true,
-		Head:          &head,
-		PublicKey:     nlPriv.Public(),
-		NodeKey:       nodeKey,
-		NodeKeySigned: selfAuthorized,
-		TrustedKeys:   outKeys,
-		FilteredPeers: filtered,
-		StateID:       stateID1,
+		Enabled:          true,
+		Head:             &head,
+		PublicKey:        nlPriv.Public(),
+		NodeKey:          nodeKey,
+		NodeKeySigned:    selfAuthorized,
+		NodeKeySignature: nodeKeySignature,
+		TrustedKeys:      outKeys,
+		FilteredPeers:    filtered,
+		StateID:          stateID1,
 	}
 }
 

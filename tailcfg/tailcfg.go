@@ -131,7 +131,13 @@ type CapabilityVersion int
 //   - 88: 2024-03-05: Client understands NodeAttrSuggestExitNode
 //   - 89: 2024-03-23: Client no longer respects deleted PeerChange.Capabilities (use CapMap)
 //   - 90: 2024-04-03: Client understands PeerCapabilityTaildrive.
-const CurrentCapabilityVersion CapabilityVersion = 90
+//   - 91: 2024-04-24: Client understands PeerCapabilityTaildriveSharer.
+//   - 92: 2024-05-06: Client understands NodeAttrUserDialUseRoutes.
+//   - 93: 2024-05-06: added support for stateful firewalling.
+//   - 94: 2024-05-06: Client understands Node.IsJailed.
+//   - 95: 2024-05-06: Client uses NodeAttrUserDialUseRoutes to change DNS dialing behavior.
+//   - 96: 2024-05-29: Client understands NodeAttrSSHBehaviorV1
+const CurrentCapabilityVersion CapabilityVersion = 96
 
 type StableID string
 
@@ -413,6 +419,11 @@ type Node struct {
 	// order to be reachable.
 	IsWireGuardOnly bool `json:",omitempty"`
 
+	// IsJailed indicates that this node is jailed and should not be allowed
+	// initiate connections, however outbound connections to it should still be
+	// allowed.
+	IsJailed bool `json:",omitempty"`
+
 	// ExitNodeDNSResolvers is the list of DNS servers that should be used when this
 	// node is marked IsWireGuardOnly and being used as an exit node.
 	ExitNodeDNSResolvers []*dnstype.Resolver `json:",omitempty"`
@@ -598,10 +609,11 @@ func isAlpha(b byte) bool {
 //
 // We might relax these rules later.
 func CheckTag(tag string) error {
-	if !strings.HasPrefix(tag, "tag:") {
+	var ok bool
+	tag, ok = strings.CutPrefix(tag, "tag:")
+	if !ok {
 		return errors.New("tags must start with 'tag:'")
 	}
-	tag = tag[4:]
 	if tag == "" {
 		return errors.New("tag names must not be empty")
 	}
@@ -1069,10 +1081,11 @@ func (st SignatureType) String() string {
 // in response to a RegisterRequest.
 type RegisterResponseAuth struct {
 	_ structs.Incomparable
-	// One of Provider/LoginName, Oauth2Token, or AuthKey is set.
-	Provider, LoginName string
-	Oauth2Token         *Oauth2Token
-	AuthKey             string
+
+	// At most one of Oauth2Token or AuthKey is set.
+
+	Oauth2Token *Oauth2Token `json:",omitempty"` // used by pre-1.66 Android only
+	AuthKey     string       `json:",omitempty"`
 }
 
 // RegisterRequest is sent by a client to register the key for a node.
@@ -1093,7 +1106,7 @@ type RegisterRequest struct {
 	NodeKey    key.NodePublic
 	OldNodeKey key.NodePublic
 	NLKey      key.NLPublic
-	Auth       RegisterResponseAuth
+	Auth       *RegisterResponseAuth `json:",omitempty"`
 	// Expiry optionally specifies the requested key expiry.
 	// The server policy may override.
 	// As a special case, if Expiry is in the past and NodeKey is
@@ -1356,8 +1369,12 @@ const (
 	// PeerCapabilityWebUI grants the ability for a peer to edit features from the
 	// device Web UI.
 	PeerCapabilityWebUI PeerCapability = "tailscale.com/cap/webui"
-	// PeerCapabilityTaildrive grants the ability for a peer to access Taildrive shares.
+	// PeerCapabilityTaildrive grants the ability for a peer to access Taildrive
+	// shares.
 	PeerCapabilityTaildrive PeerCapability = "tailscale.com/cap/drive"
+	// PeerCapabilityTaildriveSharer indicates that a peer has the ability to
+	// share folders with us.
+	PeerCapabilityTaildriveSharer PeerCapability = "tailscale.com/cap/drive-sharer"
 )
 
 // NodeCapMap is a map of capabilities to their optional values. It is valid for
@@ -2038,7 +2055,8 @@ func (n *Node) Equal(n2 *Node) bool {
 		n.Expired == n2.Expired &&
 		eqPtr(n.SelfNodeV4MasqAddrForThisPeer, n2.SelfNodeV4MasqAddrForThisPeer) &&
 		eqPtr(n.SelfNodeV6MasqAddrForThisPeer, n2.SelfNodeV6MasqAddrForThisPeer) &&
-		n.IsWireGuardOnly == n2.IsWireGuardOnly
+		n.IsWireGuardOnly == n2.IsWireGuardOnly &&
+		n.IsJailed == n2.IsJailed
 }
 
 func eqPtr[T comparable](a, b *T) bool {
@@ -2244,6 +2262,24 @@ const (
 
 	// NodeAttrLogExitFlows enables exit node destinations in network flow logs.
 	NodeAttrLogExitFlows NodeCapability = "log-exit-flows"
+
+	// NodeAttrAutoExitNode permits the automatic exit nodes feature.
+	NodeAttrAutoExitNode NodeCapability = "auto-exit-node"
+
+	// NodeAttrStoreAppCRoutes configures the node to store app connector routes persistently.
+	NodeAttrStoreAppCRoutes NodeCapability = "store-appc-routes"
+
+	// NodeAttrSuggestExitNodeUI allows the currently suggested exit node to appear in the client GUI.
+	NodeAttrSuggestExitNodeUI NodeCapability = "suggest-exit-node-ui"
+
+	// NodeAttrUserDialUseRoutes makes UserDial use either the peer dialer or the system dialer,
+	// depending on the destination address and the configured routes. When present, it also makes
+	// the DNS forwarder use UserDial instead of SystemDial when dialing resolvers.
+	NodeAttrUserDialUseRoutes NodeCapability = "user-dial-routes"
+
+	// NodeAttrSSHBehaviorV1 forces SSH to use the V1 behavior (no su, run SFTP in-process)
+	// Added 2024-05-29 in Tailscale version 1.68.
+	NodeAttrSSHBehaviorV1 NodeCapability = "ssh-behavior-v1"
 )
 
 // SetDNSRequest is a request to add a DNS record.

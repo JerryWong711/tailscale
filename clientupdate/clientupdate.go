@@ -653,6 +653,9 @@ func (up *Updater) updateAlpineLike() (err error) {
 		return fmt.Errorf(`failed to parse latest version from "apk info tailscale": %w`, err)
 	}
 	if !up.confirm(ver) {
+		if err := checkOutdatedAlpineRepo(up.Logf, ver, up.Track); err != nil {
+			up.Logf("failed to check whether Alpine release is outdated: %v", err)
+		}
 		return nil
 	}
 
@@ -688,6 +691,37 @@ func parseAlpinePackageVersion(out []byte) (string, error) {
 		return maxVer, nil
 	}
 	return "", errors.New("tailscale version not found in output")
+}
+
+var apkRepoVersionRE = regexp.MustCompile(`v[0-9]+\.[0-9]+`)
+
+func checkOutdatedAlpineRepo(logf logger.Logf, apkVer, track string) error {
+	latest, err := LatestTailscaleVersion(track)
+	if err != nil {
+		return err
+	}
+	if latest == apkVer {
+		// Actually on latest release.
+		return nil
+	}
+	f, err := os.Open("/etc/apk/repositories")
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	// Read the first repo line. Typically, there are multiple repos that all
+	// contain the same version in the path, like:
+	//   https://dl-cdn.alpinelinux.org/alpine/v3.20/main
+	//   https://dl-cdn.alpinelinux.org/alpine/v3.20/community
+	s := bufio.NewScanner(f)
+	if !s.Scan() {
+		return s.Err()
+	}
+	alpineVer := apkRepoVersionRE.FindString(s.Text())
+	if alpineVer != "" {
+		logf("The latest Tailscale release for Linux is %q, but your apk repository only provides %q.\nYour Alpine version is %q, you may need to upgrade the system to get the latest Tailscale version: https://wiki.alpinelinux.org/wiki/Upgrading_Alpine", latest, apkVer, alpineVer)
+	}
+	return nil
 }
 
 func (up *Updater) updateMacSys() error {
@@ -1016,6 +1050,20 @@ func (up *Updater) updateLinuxBinary() error {
 		up.Logf("Success")
 	}
 
+	return nil
+}
+
+func restartSystemdUnit(ctx context.Context) error {
+	if _, err := exec.LookPath("systemctl"); err != nil {
+		// Likely not a systemd-managed distro.
+		return errors.ErrUnsupported
+	}
+	if out, err := exec.Command("systemctl", "daemon-reload").CombinedOutput(); err != nil {
+		return fmt.Errorf("systemctl daemon-reload failed: %w\noutput: %s", err, out)
+	}
+	if out, err := exec.Command("systemctl", "restart", "tailscaled.service").CombinedOutput(); err != nil {
+		return fmt.Errorf("systemctl restart failed: %w\noutput: %s", err, out)
+	}
 	return nil
 }
 

@@ -28,6 +28,7 @@ import (
 	"tailscale.com/net/tsdial"
 	"tailscale.com/tstest"
 	"tailscale.com/types/dnstype"
+	"tailscale.com/types/logger"
 	"tailscale.com/util/dnsname"
 )
 
@@ -242,6 +243,43 @@ func mustIP(str string) netip.Addr {
 	return ip
 }
 
+func TestRoutesRequireNoCustomResolvers(t *testing.T) {
+	tests := []struct {
+		name     string
+		config   Config
+		expected bool
+	}{
+		{"noRoutes", Config{Routes: map[dnsname.FQDN][]*dnstype.Resolver{}}, true},
+		{"onlyDefault", Config{Routes: map[dnsname.FQDN][]*dnstype.Resolver{
+			"ts.net.": {
+				{},
+			},
+		}}, true},
+		{"oneOther", Config{Routes: map[dnsname.FQDN][]*dnstype.Resolver{
+			"example.com.": {
+				{},
+			},
+		}}, false},
+		{"defaultAndOneOther", Config{Routes: map[dnsname.FQDN][]*dnstype.Resolver{
+			"ts.net.": {
+				{},
+			},
+			"example.com.": {
+				{},
+			},
+		}}, false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := tt.config.RoutesRequireNoCustomResolvers()
+			if result != tt.expected {
+				t.Errorf("result = %v; want %v", result, tt.expected)
+			}
+		})
+	}
+}
+
 func TestRDNSNameToIPv4(t *testing.T) {
 	tests := []struct {
 		name   string
@@ -313,7 +351,11 @@ func TestRDNSNameToIPv6(t *testing.T) {
 }
 
 func newResolver(t testing.TB) *Resolver {
-	return New(t.Logf, nil /* no network monitor */, nil /* no link selector */, new(tsdial.Dialer), nil /* no control knobs */)
+	return New(t.Logf,
+		nil, // no link selector
+		tsdial.NewDialer(netmon.NewStatic()),
+		nil, // no control knobs
+	)
 }
 
 func TestResolveLocal(t *testing.T) {
@@ -1009,7 +1051,13 @@ func TestForwardLinkSelection(t *testing.T) {
 	// routes differently.
 	specialIP := netaddr.IPv4(1, 2, 3, 4)
 
-	fwd := newForwarder(t.Logf, nil, linkSelFunc(func(ip netip.Addr) string {
+	netMon, err := netmon.New(logger.WithPrefix(t.Logf, ".... netmon: "))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { netMon.Close() })
+
+	fwd := newForwarder(t.Logf, netMon, linkSelFunc(func(ip netip.Addr) string {
 		if ip == netaddr.IPv4(1, 2, 3, 4) {
 			return "special"
 		}

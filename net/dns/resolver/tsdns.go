@@ -175,13 +175,32 @@ func WriteRoutes(w *bufio.Writer, routes map[dnsname.FQDN][]*dnstype.Resolver) {
 	}
 }
 
+// RoutesRequireNoCustomResolvers returns true if this resolver.Config only contains routes
+// that do not specify a set of custom resolver(s), i.e. they can be resolved by the local
+// upstream DNS resolver.
+func (c *Config) RoutesRequireNoCustomResolvers() bool {
+	for route, resolvers := range c.Routes {
+		if route.WithoutTrailingDot() == "ts.net" {
+			// Ignore the "ts.net" route here. It always specifies the corp resolvers but
+			// its presence is not an issue, as ts.net will be a search domain.
+			continue
+		}
+		if len(resolvers) != 0 {
+			// Found a route with custom resolvers.
+			return false
+		}
+	}
+	// No routes other than ts.net have specified one or more resolvers.
+	return true
+}
+
 // Resolver is a DNS resolver for nodes on the Tailscale network,
 // associating them with domain names of the form <mynode>.<mydomain>.<root>.
 // If it is asked to resolve a domain that is not of that form,
 // it delegates to upstream nameservers if any are set.
 type Resolver struct {
 	logf               logger.Logf
-	netMon             *netmon.Monitor  // or nil
+	netMon             *netmon.Monitor  // non-nil
 	dialer             *tsdial.Dialer   // non-nil
 	saveConfigForTests func(cfg Config) // used in tests to capture resolver config
 	// forwarder forwards requests to upstream nameservers.
@@ -205,10 +224,13 @@ type ForwardLinkSelector interface {
 }
 
 // New returns a new resolver.
-// netMon optionally specifies a network monitor to use for socket rebinding.
-func New(logf logger.Logf, netMon *netmon.Monitor, linkSel ForwardLinkSelector, dialer *tsdial.Dialer, knobs *controlknobs.Knobs) *Resolver {
+func New(logf logger.Logf, linkSel ForwardLinkSelector, dialer *tsdial.Dialer, knobs *controlknobs.Knobs) *Resolver {
 	if dialer == nil {
 		panic("nil Dialer")
+	}
+	netMon := dialer.NetMon()
+	if netMon == nil {
+		logf("nil netMon")
 	}
 	r := &Resolver{
 		logf:     logger.WithPrefix(logf, "resolver: "),

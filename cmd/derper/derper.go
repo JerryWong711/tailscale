@@ -28,9 +28,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"regexp"
-	"runtime"
 	runtimemetrics "runtime/metrics"
-	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -212,58 +210,13 @@ func main() {
 		tsweb.AddBrowserHeaders(w)
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		w.WriteHeader(200)
-		io.WriteString(w, `<html><body>
-<h1>DERP</h1>
-<p>
-  This is a <a href="https://tailscale.com/">Tailscale</a> DERP server.
-</p>
-<p>
-  Documentation:
-</p>
-<ul>
-  <li><a href="https://tailscale.com/kb/1232/derp-servers">About DERP</a></li>
-  <li><a href="https://pkg.go.dev/tailscale.com/derp">Protocol & Go docs</a></li>
-  <li><a href="https://github.com/tailscale/tailscale/tree/main/cmd/derper#derp">How to run a DERP server</a></li>
-</ul>
-`)
-		if !*runDERP {
-			io.WriteString(w, `<p>Status: <b>disabled</b></p>`)
-		}
-		if tsweb.AllowDebugAccess(r) {
-			io.WriteString(w, "<p>Debug info at <a href='/debug/'>/debug/</a>.</p>\n")
-		}
+		io.WriteString(w, ``)
 	}))
 	mux.Handle("/robots.txt", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		tsweb.AddBrowserHeaders(w)
 		io.WriteString(w, "User-agent: *\nDisallow: /\n")
 	}))
 	mux.Handle("/generate_204", http.HandlerFunc(derphttp.ServeNoContent))
-	debug := tsweb.Debugger(mux)
-	debug.KV("TLS hostname", *hostname)
-	debug.KV("Mesh key", s.HasMeshKey())
-	debug.Handle("check", "Consistency check", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		err := s.ConsistencyCheck()
-		if err != nil {
-			http.Error(w, err.Error(), 500)
-		} else {
-			io.WriteString(w, "derp.Server ConsistencyCheck okay")
-		}
-	}))
-	debug.Handle("traffic", "Traffic check", http.HandlerFunc(s.ServeDebugTraffic))
-	debug.Handle("set-mutex-profile-fraction", "SetMutexProfileFraction", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		s := r.FormValue("rate")
-		if s == "" || r.Header.Get("Sec-Debug") != "derp" {
-			http.Error(w, "To set, use: curl -HSec-Debug:derp 'http://derp/debug/set-mutex-profile-fraction?rate=100'", http.StatusBadRequest)
-			return
-		}
-		v, err := strconv.Atoi(s)
-		if err != nil {
-			http.Error(w, "bad rate value", http.StatusBadRequest)
-			return
-		}
-		old := runtime.SetMutexProfileFraction(v)
-		fmt.Fprintf(w, "mutex changed from %v to %v\n", old, v)
-	}))
 
 	// Longer lived DERP connections send an application layer keepalive. Note
 	// if the keepalive is hit, the user timeout will take precedence over the
